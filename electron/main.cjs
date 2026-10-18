@@ -102,7 +102,6 @@ function pauseAllVideos(win) {
 const { Readable } = require('stream');
 const { finished } = require('stream/promises');
 const crypto = require('crypto');
-const zlib = require('zlib');
 const express = require('express');
 const http = require('http');
 const { ElectronBlocker } = require('@ghostery/adblocker-electron');
@@ -111,18 +110,6 @@ const { ElectronBlocker } = require('@ghostery/adblocker-electron');
 let proxyPort = 0;
 const proxyApp = express();
 const streamCache = new Map();
-
-// Enable global CORS on local proxy server
-proxyApp.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-  res.header('Accept-Ranges', 'bytes');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
-  next();
-});
 
 // Helper to rewrite all segment URLs and sub-playlists inside .m3u8 files to route through the local proxy.
 function rewriteM3U8(content, baseUrl, referer, proxyBaseUrl) {
@@ -159,6 +146,8 @@ function rewriteM3U8(content, baseUrl, referer, proxyBaseUrl) {
 }
 
 // --- PROXY STREAMING ON-THE-FLY ---
+// Uses native Node.js HTTP/HTTPS to ensure the proxy is completely transparent without auto-decompression,
+// preventing byte mismatches and playback freezes. Guaranteed to run smoothly and reliably.
 proxyApp.get('/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   const referer = req.query.referer || '';
@@ -184,19 +173,18 @@ proxyApp.get('/proxy', async (req, res) => {
       const urlObj = new URL(currentUrl);
       const client = urlObj.protocol === 'https:' ? require('https') : require('http');
 
-      const lowerHost = urlObj.hostname.toLowerCase();
-      let parentSiteUrl = '';
-      if (lowerHost.includes('phncdn.com') || lowerHost.includes('portalcdn.com') || lowerHost.includes('pornhub')) {
-        parentSiteUrl = 'https://www.pornhub.com/';
-      } else if (lowerHost.includes('sb-cd.com') || lowerHost.includes('sb-preview') || lowerHost.includes('spankbang')) {
-        parentSiteUrl = 'https://spankbang.com/';
-      } else if (lowerHost.includes('xhcdn.com') || lowerHost.includes('xhpingcdn') || lowerHost.includes('xhamster')) {
-        parentSiteUrl = 'https://xhamster.com/';
-      } else if (lowerHost.includes('googlevideo.com') || lowerHost.includes('youtube')) {
-        parentSiteUrl = 'https://www.youtube.com/';
+      // Ambil cookie dari session Electron
+      const { session } = require('electron');
+      const cookiesUrl = await session.defaultSession.cookies.get({ url: currentUrl });
+      const cookiesRef = referer ? await session.defaultSession.cookies.get({ url: referer }) : [];
+      const allCookies = [...cookiesUrl, ...cookiesRef];
+      const uniqueCookies = Array.from(new Map(allCookies.map(c => [c.name, c])).values());
+      let cookiesStr = '';
+      if (uniqueCookies.length > 0) {
+        cookiesStr = uniqueCookies.map(c => `${c.name}=${c.value}`).join('; ');
       }
 
-      let spoofedReferer = referer || parentSiteUrl;
+      let spoofedReferer = referer;
       if (!spoofedReferer) {
         try {
           const hostnameParts = urlObj.hostname.split('.');
@@ -208,19 +196,8 @@ proxyApp.get('/proxy', async (req, res) => {
         } catch (e) {}
       }
 
-      // Ambil cookie dari session Electron
-      const { session } = require('electron');
-      const cookiesUrl = await session.defaultSession.cookies.get({ url: currentUrl }).catch(() => []);
-      const cookiesRef = spoofedReferer ? await session.defaultSession.cookies.get({ url: spoofedReferer }).catch(() => []) : [];
-      const allCookies = [...cookiesUrl, ...cookiesRef];
-      const uniqueCookies = Array.from(new Map(allCookies.map(c => [c.name, c])).values());
-      let cookiesStr = '';
-      if (uniqueCookies.length > 0) {
-        cookiesStr = uniqueCookies.map(c => `${c.name}=${c.value}`).join('; ');
-      }
-
       const chromeMatch = app.userAgentFallback.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
-      const chromeVersion = chromeMatch ? chromeMatch[1] : '134.0.0.0';
+      const chromeVersion = chromeMatch ? chromeMatch[1] : '116.0.0.0';
       const mobileUA = `Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Mobile Safari/537.36`;
       const desktopUA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
 
@@ -229,7 +206,7 @@ proxyApp.get('/proxy', async (req, res) => {
         'Accept': '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Connection': 'keep-alive',
-        'Accept-Encoding': 'identity',
+        'Accept-Encoding': 'identity', // Request raw uncompressed data to easily read and rewrite the .m3u8 playlist.
         ...(spoofedReferer && { 'Referer': spoofedReferer }),
         ...(cookiesStr && { 'Cookie': cookiesStr })
       };
@@ -247,15 +224,8 @@ proxyApp.get('/proxy', async (req, res) => {
       }
 
       // Forward range request from the browser to the target server.
-      let startPos = 0;
-      let endPos = null;
       if (req.headers.range) {
         headers['Range'] = req.headers.range;
-        const parts = req.headers.range.replace(/bytes=/, "").split("-");
-        startPos = parseInt(parts[0], 10) || 0;
-        if (parts[1]) {
-          endPos = parseInt(parts[1], 10);
-        }
       }
 
       const promise = new Promise((resolve, reject) => {
@@ -277,16 +247,12 @@ proxyApp.get('/proxy', async (req, res) => {
           // Kirim status code & header asli dari server ke client tanpa modifikasi aneh-aneh!
           res.status(proxyRes.statusCode);
           Object.keys(proxyRes.headers).forEach((key) => {
-            const k = key.toLowerCase();
-            if (['connection', 'keep-alive'].includes(k)) return;
-            if (k.startsWith('access-control-')) return;
-            if (isM3U8 && ['content-encoding', 'content-length'].includes(k)) return;
+            if (['connection', 'keep-alive'].includes(key.toLowerCase())) return;
+            // If this is an HLS playlist (.m3u8), do not forward the original content-encoding or content-length headers since we rewrite the contents.
+            if (isM3U8 && ['content-encoding', 'content-length'].includes(key.toLowerCase())) return;
             res.setHeader(key, proxyRes.headers[key]);
           });
           res.setHeader('Access-Control-Allow-Origin', '*');
-          res.setHeader('Access-Control-Allow-Headers', '*');
-          res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-          res.setHeader('Accept-Ranges', 'bytes');
 
           // Set up progress tracking to keep the OSD updated during buffering.
           let startPos = 0;
@@ -298,25 +264,15 @@ proxyApp.get('/proxy', async (req, res) => {
           cacheInfo.status = 'downloading';
 
           if (isM3U8) {
-            // Decompress stream if server sent compressed m3u8
-            let stream = proxyRes;
-            const encoding = (proxyRes.headers['content-encoding'] || '').toLowerCase();
-            if (encoding === 'gzip') {
-              stream = proxyRes.pipe(zlib.createGunzip());
-            } else if (encoding === 'deflate') {
-              stream = proxyRes.pipe(zlib.createInflate());
-            } else if (encoding === 'br') {
-              stream = proxyRes.pipe(zlib.createBrotliDecompress());
-            }
-
+            // Buffer the entire .m3u8 playlist content to dynamically rewrite its segments.
             let chunks = [];
-            stream.on('data', (chunk) => {
+            proxyRes.on('data', (chunk) => {
               chunks.push(chunk);
             });
-            stream.on('end', () => {
+            proxyRes.on('end', () => {
               const fullBuffer = Buffer.concat(chunks);
               const originalText = fullBuffer.toString('utf8');
-              const rewrittenText = rewriteM3U8(originalText, currentUrl, spoofedReferer, `http://127.0.0.1:${proxyPort}/proxy`);
+              const rewrittenText = rewriteM3U8(originalText, currentUrl, referer, `http://127.0.0.1:${proxyPort}/proxy`);
               const outputBuffer = Buffer.from(rewrittenText, 'utf8');
 
               res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
@@ -325,7 +281,7 @@ proxyApp.get('/proxy', async (req, res) => {
               cacheInfo.status = 'completed';
               resolve({ isRedirect: false });
             });
-            stream.on('error', (err) => {
+            proxyRes.on('error', (err) => {
               cacheInfo.status = 'error';
               reject(err);
             });
@@ -363,53 +319,6 @@ proxyApp.get('/proxy', async (req, res) => {
             cacheInfo.status = 'error';
           });
 
-          // If upstream returned 200 OK but client requested range starting > 0, slice response
-          if (proxyRes.statusCode === 200 && startPos > 0) {
-            res.status(206);
-            const total = cacheInfo.totalBytes || parseInt(contentLength || 0, 10);
-            if (total) {
-              const actualEnd = (endPos !== null && !isNaN(endPos)) ? endPos : total - 1;
-              res.setHeader('Content-Range', 'bytes ' + startPos + '-' + actualEnd + '/' + total);
-              res.setHeader('Content-Length', actualEnd - startPos + 1);
-            }
-            let currentBytes = 0;
-            let skippedBytes = 0;
-            proxyRes.on('data', (chunk) => {
-              cacheInfo.downloadedBytes += chunk.length;
-              if (skippedBytes < startPos) {
-                const remainingToSkip = startPos - skippedBytes;
-                if (chunk.length <= remainingToSkip) {
-                  skippedBytes += chunk.length;
-                  return;
-                } else {
-                  const sliceChunk = chunk.slice(remainingToSkip);
-                  skippedBytes = startPos;
-                  currentBytes += sliceChunk.length;
-                  res.write(sliceChunk);
-                }
-              } else {
-                if (endPos !== null && currentBytes >= (endPos - startPos + 1)) {
-                  return;
-                }
-                const takeChunk = (endPos !== null && currentBytes + chunk.length > (endPos - startPos + 1))
-                  ? chunk.slice(0, (endPos - startPos + 1) - currentBytes)
-                  : chunk;
-                currentBytes += takeChunk.length;
-                res.write(takeChunk);
-              }
-            });
-            proxyRes.on('end', () => {
-              cacheInfo.status = 'completed';
-              res.end();
-            });
-            proxyRes.on('error', () => {
-              cacheInfo.status = 'error';
-              try { res.end(); } catch(e) {}
-            });
-            resolve({ isRedirect: false });
-            return;
-          }
-
           // Pipe data langsung ke browser
           proxyRes.pipe(res);
           resolve({ isRedirect: false });
@@ -420,9 +329,9 @@ proxyApp.get('/proxy', async (req, res) => {
         });
 
         req.on('close', () => {
-          // Close upstream connection if client closes connection
-          try { proxyReq.destroy(); } catch (e) {}
-          resolve({ isRedirect: false });
+          // Close upstream connection if user seeks or closes the video to save bandwidth.
+          proxyReq.destroy();
+          reject(new Error('Client aborted the request'));
         });
 
         proxyReq.end();
@@ -1118,10 +1027,8 @@ ipcMain.handle('get-mpv-status', async () => {
 });
 
 ipcMain.on('video-detected', (event, videoData) => {
-  for (const win of openWindows) {
-    if (win && !win.isDestroyed() && win.webContents) {
-      win.webContents.send('video-detected', videoData);
-    }
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+    mainWindow.webContents.send('video-detected', videoData);
   }
 });
 
@@ -1328,7 +1235,7 @@ function getWindowFromEvent(event) {
 let adBlockEnabled = true;
 let popupBlockEnabled = true;
 let engineBlocker = null;
-let snifferIsMobile = false;
+let snifferIsMobile = true;
 let currentLanguage = 'id';
 
 function isUrlAdOrBlocked(urlStr, isPopupOrNewTab = false) {
@@ -1931,17 +1838,7 @@ const customFetch = (url, options) => {
 @@||turnstile.cloudflare.com^
 @@||recu.me^
 @@||googlevideo.com^
-@@||phncdn.com^
-@@||portalcdn.com^
-@@||sb-cd.com^
-@@||sb-preview.com^
-@@||xhcdn.com^
-@@||xhpingcdn.com^
-@@||trafficjunky.com^
-@@||trafficjunky.net^
-@@||media.trafficjunky.net^
-@@||abp/js1.js^
-@@||ads_test.js^
+
 ! === UBLOCK ORIGIN AGGRESSIVE AFFILIATE BLOCKER ===
 ! Blokir paksa semua parameter affiliate e-commerce (Shopee, Tokopedia, Lazada)
 ||shopee.*^*mmp_pid=
@@ -1963,96 +1860,6 @@ const customFetch = (url, options) => {
 ! Blokir network e-commerce jika dipanggil sebagai script/iframe tersembunyi
 ||shopee.co.id^$subdocument,third-party
 ||tokopedia.com^$subdocument,third-party
-
-! === MAJOR AD NETWORKS & VIDEO ADS (BUILT-IN ZERO-LATENCY FALLBACK) ===
-||ads.pornhub.com^
-||ads.xhamster.com^
-||ads.spankbang.com^
-||ad.pornhub.com^
-||ad.xhamster.com^
-||ad.spankbang.com^
-||static.ads.pornhub.com^
-||static.ads.xhamster.com^
-||static.ads.spankbang.com^
-||cdn.ads.pornhub.com^
-||cdn.ads.xhamster.com^
-||cdn.ads.spankbang.com^
-||vast.pornhub.com^
-||vast.xhamster.com^
-||vast.spankbang.com^
-||vpaid.pornhub.com^
-||vpaid.xhamster.com^
-||vpaid.spankbang.com^
-||preroll.pornhub.com^
-||preroll.xhamster.com^
-||preroll.spankbang.com^
-||postroll.pornhub.com^
-||postroll.xhamster.com^
-||postroll.spankbang.com^
-||midroll.pornhub.com^
-||midroll.xhamster.com^
-||midroll.spankbang.com^
-||adtech.pornhub.com^
-||adtech.xhamster.com^
-||adtech.spankbang.com^
-||v.pornhub.com/ads^
-||v.xhamster.com/ads^
-||v.spankbang.com/ads^
-||cdn.video.pornhub.com/ads^
-||cdn.video.xhamster.com/ads^
-||cdn.video.spankbang.com/ads^
-||player.pornhub.com/js/ads^
-||player.xhamster.com/js/ads^
-||player.spankbang.com/js/ads^
-||doubleclick.net^
-||googlesyndication.com^
-||googleadservices.com^
-||adservice.google.*^
-||adnxs.com^
-||taboola.com^
-||outbrain.com^
-||popads.net^
-||propellerads.com^
-||adsterra.com^
-||exoclick.com^
-||juicyads.com^
-||clickadu.com^
-||hilltopads.com^
-||yllix.com^
-||mgid.com^
-||revcontent.com^
-||bidvertiser.com^
-||infolinks.com^
-||adcash.com^
-||zergnet.com^
-||popcash.net^
-||adxadserv.com^
-||syndication.exdynsrv.com^
-||tsyndicate.com^
-||etahub.com^
-||traffichaus.com^
-||ad-delivery.net^
-||a.magsrv.com^
-||b.magsrv.com^
-||c.magsrv.com^
-||creative.magsrv.com^
-||delivery.magsrv.com^
-||disqusads.com^
-||adroll.com^
-||criteo.com^
-||criteo.net^
-||rubiconproject.com^
-||pubmatic.com^
-||openx.net^
-||smartadserver.com^
-||moatads.com^
-||scorecardresearch.com^
-||yandex.ru/ads^
-||an.yandex.ru^
-||adservice.google.com^
-||ad.doubleclick.net^
-||static.doubleclick.net^
-||stats.g.doubleclick.net^
 `),
       ok: true
     });
@@ -2078,227 +1885,23 @@ const adblockFilterLists = [
 let adblockAbortController = null;
 let isAdblockUpdating = false;
 
-// --- REQUEST ORIGINS FOR CORS TRACKING ---
-const requestOrigins = new Map();
-
-function applyCustomCORSAndEmbeddingHeaders(details, originalHeaders = {}) {
-  try {
-    const urlObj = new URL(details.url);
-    if (urlObj.hostname === 'localhost' || urlObj.hostname === '127.0.0.1') {
-      return originalHeaders;
-    }
-    
-    const isGoogleOrOauth = 
-      urlObj.hostname.includes('google.com') || 
-      urlObj.hostname.includes('googleusercontent.com') ||
-      urlObj.hostname.includes('googleapis.com') ||
-      urlObj.hostname.includes('youtube.com') ||
-      urlObj.hostname.includes('facebook.com') ||
-      urlObj.hostname.includes('github.com') ||
-      urlObj.hostname.includes('discord.com');
-      
-    if (isGoogleOrOauth) {
-      return originalHeaders;
-    }
-  } catch (e) {}
-
-  const responseHeaders = { ...originalHeaders };
-
-  // Always delete restrictive CSP and X-Frame-Options so video players, web workers, blob scripts, and stylesheets are never blocked
-  delete responseHeaders['X-Frame-Options'];
-  delete responseHeaders['x-frame-options'];
-  delete responseHeaders['Content-Security-Policy'];
-  delete responseHeaders['content-security-policy'];
-  delete responseHeaders['Content-Security-Policy-Report-Only'];
-  delete responseHeaders['content-security-policy-report-only'];
-
-  const urlLower = (details.url || '').toLowerCase();
-  const isMediaResource = details.resourceType === 'media' || 
-    urlLower.includes('.m3u8') || urlLower.includes('.mpd') || 
-    urlLower.includes('.mp4') || urlLower.includes('.webm') || 
-    urlLower.includes('.ts') || urlLower.includes('.m4s');
-
-  // ONLY modify CORS headers for MEDIA resources so Web Audio API can process audio without breaking stylesheets or scripts!
-  if (isMediaResource) {
-    let origin = requestOrigins.get(details.id);
-    requestOrigins.delete(details.id);
-
-    if (!origin && details.referrer) {
-      try {
-        origin = new URL(details.referrer).origin;
-      } catch (e) {}
-    }
-
-    const corsHeaders = {
-      'Access-Control-Allow-Methods': ['GET, POST, OPTIONS, PUT, DELETE, PATCH'],
-      'Access-Control-Allow-Headers': ['Content-Type, Range, Authorization, X-Requested-With, Cache-Control, Accept, Origin, Accept-Encoding'],
-      'Access-Control-Expose-Headers': ['Content-Length, Content-Range, Content-Type, Accept-Ranges'],
-    };
-
-    if (origin && origin !== 'null') {
-      corsHeaders['Access-Control-Allow-Origin'] = [origin];
-      corsHeaders['Access-Control-Allow-Credentials'] = ['true'];
-    } else {
-      corsHeaders['Access-Control-Allow-Origin'] = ['*'];
-      delete responseHeaders['Access-Control-Allow-Credentials'];
-      delete responseHeaders['access-control-allow-credentials'];
-    }
-
-    Object.keys(corsHeaders).forEach(key => {
-      responseHeaders[key] = corsHeaders[key];
-    });
-  }
-
-  return responseHeaders;
-}
-
-function setupFallbackHeadersReceived() {
-  if (!app.isReady() || !session.defaultSession) return;
-  if (adBlockEnabled && engineBlocker && engineBlocker.isBlockingEnabled(session.defaultSession)) {
-    return;
-  }
-  try {
-    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-      const responseHeaders = applyCustomCORSAndEmbeddingHeaders(details, details.responseHeaders || {});
-      const isOptions = details.method === 'OPTIONS';
-      const responseData = { cancel: false, responseHeaders };
-      if (isOptions) {
-        responseData.statusLine = 'HTTP/1.1 200 OK';
-      }
-      callback(responseData);
-    });
-  } catch (e) {
-    logStream(`[CORS] Failed to set fallback onHeadersReceived: ${e.message}`);
-  }
-}
-
-function enableAdblockInSessionSafe() {
-  if (!engineBlocker) return;
-  if (!app.isReady() || !session.defaultSession) {
-    return; // Will be called inside app.whenReady()
-  }
-  if (!adBlockEnabled) {
-    setupFallbackHeadersReceived();
-    return;
-  }
-
-  try {
-    if (!engineBlocker.isBlockingEnabled(session.defaultSession)) {
-      engineBlocker.enableBlockingInSession(session.defaultSession);
-      logStream('[AdBlock] Ghostery AdBlocker successfully enabled in session.defaultSession.');
-    }
-  } catch (e) {
-    logStream(`[AdBlock Error] Failed to enable Ghostery AdBlocker: ${e.message}`);
-  }
-}
-
 function applyEngineBlocker(blocker) {
   if (!blocker) return;
-  const oldBlocker = engineBlocker;
   engineBlocker = blocker;
   logStream('Ghostery AdBlocker engine loaded successfully.');
-
-  // Safely disable old blocker and remove Ghostery IPC handlers so new blocker won't throw registration errors
-  if (oldBlocker && oldBlocker !== blocker && app.isReady() && session.defaultSession) {
-    try {
-      if (oldBlocker.isBlockingEnabled(session.defaultSession)) {
-        oldBlocker.disableBlockingInSession(session.defaultSession);
-      }
-    } catch (e) {}
-  }
-  try { ipcMain.removeHandler('@ghostery/adblocker/inject-cosmetic-filters'); } catch (e) {}
-  try { ipcMain.removeHandler('@ghostery/adblocker/is-mutation-observer-enabled'); } catch (e) {}
-  try { ipcMain.removeHandler('get-cosmetic-filters-2'); } catch (e) {}
-  try { ipcMain.removeHandler('is-mutation-observer-enabled-2'); } catch (e) {}
   
   // Wrap engineBlocker.onBeforeRequest to track blocked ads
   const originalOnBeforeRequest = engineBlocker.onBeforeRequest;
   engineBlocker.onBeforeRequest = (details, callback) => {
     const urlStr = details.url ? details.url.toLowerCase() : '';
-    
-    // 1. Never block media streams, video chunks, playlists, or subtitles
-    if (details.resourceType === 'media' ||
-        urlStr.includes('.mp4') || 
-        urlStr.includes('.m3u8') || 
-        urlStr.includes('.mpd') || 
-        urlStr.includes('.webm') || 
-        urlStr.includes('.ts') || 
-        urlStr.includes('.m4s') || 
-        urlStr.includes('/api/timedtext') || 
+    // Bypass adblocker for all subtitle/caption/timedtext/vtt/srt requests
+    if (urlStr.includes('/api/timedtext') || 
         urlStr.includes('timedtext') || 
         urlStr.includes('captions') || 
         urlStr.includes('subtitles') || 
         urlStr.includes('.vtt') || 
         urlStr.includes('.srt')) {
       return callback({ cancel: false });
-    }
-
-    // 2. Never block essential first-party CDNs and video player scripts
-    if (urlStr.includes('pornhub.com') ||
-        urlStr.includes('spankbang.com') ||
-        urlStr.includes('xhamster.com') ||
-        urlStr.includes('phncdn.com') ||
-        urlStr.includes('portalcdn.com') ||
-        urlStr.includes('sb-cd.com') ||
-        urlStr.includes('sb-preview.com') ||
-        urlStr.includes('xhcdn.com') ||
-        urlStr.includes('xhpingcdn.com')) {
-      if (!urlStr.includes('/ads/') && 
-          !urlStr.includes('doubleclick') && 
-          !urlStr.includes('popads') && 
-          !urlStr.includes('exoclick') && 
-          !urlStr.includes('propeller')) {
-        return callback({ cancel: false });
-      }
-    }
-
-    // 3. Always allow essential player handshake scripts globally to prevent player stalls
-    if (urlStr.includes('trafficjunky.net') ||
-        urlStr.includes('trafficjunky.com') ||
-        urlStr.includes('abp/js1.js') ||
-        urlStr.includes('ads_test.js') ||
-        urlStr.includes('et-code') ||
-        urlStr.includes('doublepimp') ||
-        urlStr.includes('imasdk')) {
-      return callback({ cancel: false });
-    }
-
-    // 4. Prevent player stall on video sites requiring ad handshake / anti-adblock test scripts (Pornhub / Spankbang / xHamster)
-    let isAdultOrStreamingTab = false;
-    const refLower = (details.referrer || '').toLowerCase();
-    if (refLower.includes('pornhub') || refLower.includes('spankbang') || refLower.includes('xhamster') ||
-        urlStr.includes('pornhub') || urlStr.includes('spankbang') || urlStr.includes('xhamster') ||
-        urlStr.includes('phncdn') || urlStr.includes('sb-cd') || urlStr.includes('xhcdn')) {
-      isAdultOrStreamingTab = true;
-    } else {
-      for (const win of openWindows) {
-        if (win && !win.isDestroyed() && win.snifferViews) {
-          for (const view of win.snifferViews.values()) {
-            if (view.webContents && view.webContents.id === details.webContentsId) {
-              const currentTabUrl = (view.webContents.getURL() || '').toLowerCase();
-              if (currentTabUrl.includes('pornhub') || currentTabUrl.includes('spankbang') || currentTabUrl.includes('xhamster')) {
-                isAdultOrStreamingTab = true;
-              }
-              break;
-            }
-          }
-        }
-        if (isAdultOrStreamingTab) break;
-      }
-    }
-
-    if (isAdultOrStreamingTab) {
-      if (urlStr.includes('vast') || 
-          urlStr.includes('gstatic.com') ||
-          urlStr.includes('video/ad_tags') ||
-          urlStr.includes('/api/videos/stream') ||
-          urlStr.includes('/video/get_media') ||
-          urlStr.includes('/front/authenticate') ||
-          urlStr.includes('/front/collect') ||
-          urlStr.includes('player') ||
-          urlStr.includes('mgp')) {
-        return callback({ cancel: false });
-      }
     }
 
     originalOnBeforeRequest(details, (response) => {
@@ -2349,47 +1952,29 @@ function applyEngineBlocker(blocker) {
     });
   };
 
-  // Wrap engineBlocker.onHeadersReceived so Ghostery's CSP blocking & our CORS media headers coexist seamlessly
-  // Pass through response headers to applyCustomCORSAndEmbeddingHeaders directly so Ghostery cannot inject broken CSP onto websites
-  engineBlocker.onHeadersReceived = (details, callback) => {
-    const finalHeaders = applyCustomCORSAndEmbeddingHeaders(details, details.responseHeaders || {});
-    const isOptions = details.method === 'OPTIONS';
-    const result = {
-      cancel: false,
-      responseHeaders: finalHeaders
-    };
-    if (isOptions) {
-      result.statusLine = 'HTTP/1.1 200 OK';
-    }
-    callback(result);
-  };
-
-  enableAdblockInSessionSafe();
-}
-
-// 1. Initial quick load on startup (using fast binary deserialization if cached, or built-in ad filters)
-function initAdblockEngineOnStartup() {
-  if (fs.existsSync(adblockEnginePath)) {
+  if (adBlockEnabled && session.defaultSession) {
     try {
-      const cachedBuffer = fs.readFileSync(adblockEnginePath);
-      if (cachedBuffer && cachedBuffer.length > 200) {
-        const restored = ElectronBlocker.deserialize(cachedBuffer);
-        applyEngineBlocker(restored);
-        logStream(`[AdBlock] Cache engine filter berhasil dimuat seketika (${(cachedBuffer.length / 1024).toFixed(1)} KB).`);
-        return;
-      }
-    } catch (err) {
-      logStream(`[AdBlock] Gagal membaca file cache engine: ${err.message}`);
+      engineBlocker.enableBlockingInSession(session.defaultSession);
+    } catch (e) {
+      logStream(`Failed to enable Ghostery AdBlocker: ${e.message}`);
     }
   }
-
-  // Fallback: inisialisasi filter bawaan (termasuk major ad networks built-in)
-  ElectronBlocker.fromLists(customFetch, ['custom:whitelist']).then(applyEngineBlocker).catch(err => {
-    logStream(`[AdBlock] Gagal inisialisasi filter awal: ${err.message}`);
-  });
 }
 
-initAdblockEngineOnStartup();
+// 1. Initial quick load on startup (using cached engine if available, or lightweight whitelist)
+if (fs.existsSync(adblockEnginePath)) {
+  ElectronBlocker.fromLists(customFetch, adblockFilterLists, {
+    path: adblockEnginePath,
+    read: fs.promises.readFile,
+    write: fs.promises.writeFile,
+  }).then(applyEngineBlocker).catch(err => {
+    logStream(`[AdBlock] Failed to load cached engine: ${err.message}`);
+  });
+} else {
+  ElectronBlocker.fromLists(customFetch, ['custom:whitelist']).then(applyEngineBlocker).catch(err => {
+    logStream(`[AdBlock] Failed to init initial whitelist blocker: ${err.message}`);
+  });
+}
 
 // 2. Background updater: only runs while main window is open
 async function updateAdblockEngineInBackground() {
@@ -2419,8 +2004,7 @@ async function updateAdblockEngineInBackground() {
 
   const tempEnginePath = path.join(app.getPath('userData'), `adblocker-engine-temp-${Date.now()}.bin`);
   try {
-    // Correct 4-argument call: (fetch, urls, config, caching)
-    const newBlocker = await ElectronBlocker.fromLists(fetchWithSignal, adblockFilterLists, {}, {
+    const newBlocker = await ElectronBlocker.fromLists(fetchWithSignal, adblockFilterLists, {
       path: tempEnginePath,
       read: fs.promises.readFile,
       write: fs.promises.writeFile,
@@ -2433,14 +2017,11 @@ async function updateAdblockEngineInBackground() {
     }
 
     try {
-      const serialized = newBlocker.serialize();
-      fs.writeFileSync(tempEnginePath, serialized);
-      fs.copyFileSync(tempEnginePath, adblockEnginePath);
-      try { fs.unlinkSync(tempEnginePath); } catch (e) {}
-      logStream(`[AdBlock] Cache filter adblock disimpan permanen (${(serialized.length / 1024).toFixed(1)} KB).`);
-    } catch (e) {
-      logStream(`[AdBlock Error] Gagal menyimpan cache engine: ${e.message}`);
-    }
+      if (fs.existsSync(tempEnginePath)) {
+        fs.copyFileSync(tempEnginePath, adblockEnginePath);
+        fs.unlinkSync(tempEnginePath);
+      }
+    } catch (e) {}
 
     if (openWindows.length > 0) {
       applyEngineBlocker(newBlocker);
@@ -2530,7 +2111,6 @@ function createWindow (initialVideoPath = null) {
   win.tabAudibleStates = new Map();
 
   // Set up periodic real-time sync of tab audible and muted state (extremely robust and handles background tabs in real-time)
-  let streamExtractTick = 0;
   win.snifferSyncInterval = setInterval(() => {
     if (win.isDestroyed()) {
       clearInterval(win.snifferSyncInterval);
@@ -2544,17 +2124,6 @@ function createWindow (initialVideoPath = null) {
             const isMuted = view.webContents.isAudioMuted();
             updateTabAudibleState(win, tabId, isPlaying);
             win.webContents.send('sniffer-mute-updated', { tabId, isMuted });
-          } catch (e) {}
-        }
-      }
-
-      // Periodically sniff streams from active tab view every 2 seconds
-      streamExtractTick++;
-      if (streamExtractTick % 8 === 0 && win.activeTabId) {
-        const activeView = win.snifferViews.get(win.activeTabId);
-        if (activeView && activeView.webContents && !activeView.webContents.isDestroyed()) {
-          try {
-            extractStreamsFromView(win, activeView);
           } catch (e) {}
         }
       }
@@ -3715,8 +3284,6 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
     }
   }
 
-  enableAdblockInSessionSafe();
-
   const { WebContentsView } = require('electron');
   view = new WebContentsView({
     webPreferences: {
@@ -3725,8 +3292,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
       webSecurity: true,
       preload: path.join(__dirname, 'sniffer-preload.cjs'),
       zoomFactor: 1.0,
-      backgroundThrottling: false,
-      autoplayPolicy: 'no-user-gesture-required'
+      backgroundThrottling: false
     }
   });
   
@@ -3773,7 +3339,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
 
   // Set User Agent
   const chromeMatch = app.userAgentFallback.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
-  const chromeVersion = chromeMatch ? chromeMatch[1] : '134.0.0.0';
+  const chromeVersion = chromeMatch ? chromeMatch[1] : '116.0.0.0';
   const mobileUA = `Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Mobile Safari/537.36`;
   const desktopUA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
   const firefoxUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0';
@@ -3802,7 +3368,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
       )) {
         logStream(`[Bantai] Affiliate licik ketangkap basah: ${popupUrl}`);
         if (win && !win.isDestroyed() && win.webContents) {
-          win.webContents.send('popup-blocked', {
+          win.webContents.send('video-detected', {
             url: popupUrl || 'about:blank',
             type: 'POPUP (BLOCKED)',
             timestamp: Date.now(),
@@ -3849,7 +3415,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
       if (popupBlockEnabled && userGesture === false) {
         logStream(`[POPUP BLOCKED - NO USER GESTURE] Denied automatic window open: ${popupUrl}`);
         if (win && !win.isDestroyed() && win.webContents) {
-          win.webContents.send('popup-blocked', {
+          win.webContents.send('video-detected', {
             url: popupUrl || 'about:blank',
             type: 'POPUP (BLOCKED)',
             timestamp: Date.now(),
@@ -3863,7 +3429,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
       if ((popupBlockEnabled || adBlockEnabled) && isUrlAdOrBlocked(popupUrl, true)) {
         logStream(`[POPUP BLOCKED - ADBLOCK MATCH] Denied opening new tab/popup for: ${popupUrl}`);
         if (win && !win.isDestroyed() && win.webContents) {
-          win.webContents.send('popup-blocked', {
+          win.webContents.send('video-detected', {
             url: popupUrl || 'about:blank',
             type: 'POPUP (BLOCKED)',
             timestamp: Date.now(),
@@ -3906,7 +3472,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
       // Always set standard Desktop User Agent or Firefox UA on child windows/popups to bypass Google login / OAuth blocks
       if (childWindow && childWindow.webContents) {
         const chromeMatch = app.userAgentFallback.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
-        const chromeVersion = chromeMatch ? chromeMatch[1] : '134.0.0.0';
+        const chromeVersion = chromeMatch ? chromeMatch[1] : '116.0.0.0';
         const desktopUA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
         const firefoxUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0';
 
@@ -3992,7 +3558,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
       // Only destroy if it's a known ad or popup block is enabled on non-auth URLs
       if (popupBlockEnabled || (adBlockEnabled && isUrlAdOrBlocked(initialUrl, true))) {
         if (win && !win.isDestroyed() && win.webContents) {
-          win.webContents.send('popup-blocked', {
+          win.webContents.send('video-detected', {
             url: initialUrl,
             type: 'POPUP (BLOCKED)',
             timestamp: Date.now(),
@@ -4008,114 +3574,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
     });
   }
 
-  function extractStreamsFromView(win, view) {
-    if (!view || !view.webContents || view.webContents.isDestroyed()) return;
-    const currentUrl = (view.webContents.getURL() || '').toLowerCase();
-    if (!currentUrl.startsWith('http://') && !currentUrl.startsWith('https://')) return;
-
-    const script = `
-      (function() {
-        try {
-          const streams = [];
-          const seen = new Set();
-          function add(u, type, quality) {
-            if (!u || typeof u !== 'string') return;
-            const clean = u.trim();
-            if (!clean.startsWith('http://') && !clean.startsWith('https://')) return;
-            if (seen.has(clean)) return;
-            seen.add(clean);
-            streams.push({
-              url: clean,
-              type: (type || 'STREAM VIDEO') + (quality ? ' [' + quality + ']' : ''),
-              title: document.title || 'Video'
-            });
-          }
-
-          // 1. Spankbang
-          if (window.stream_data && typeof window.stream_data === 'object') {
-            for (const [k, v] of Object.entries(window.stream_data)) {
-              const u = Array.isArray(v) ? v[0] : v;
-              if (typeof u === 'string') add(u, k.includes('m3u8') ? 'HLS STREAM' : 'DIRECT VIDEO', k);
-            }
-          }
-          for (const k of Object.keys(window)) {
-            if (k.startsWith('stream_url_')) {
-              const u = window[k];
-              const q = k.replace('stream_url_', '');
-              if (typeof u === 'string') add(u, q.includes('m3u8') ? 'HLS STREAM' : 'DIRECT VIDEO', q);
-            }
-          }
-
-          // 2. Pornhub
-          for (const k of Object.keys(window)) {
-            if (k.startsWith('flashvars_')) {
-              const fv = window[k];
-              if (fv && fv.mediaDefinitions && Array.isArray(fv.mediaDefinitions)) {
-                fv.mediaDefinitions.forEach(m => {
-                  if (m && m.videoUrl) {
-                    const q = m.quality ? (m.quality + 'p') : (m.format || '');
-                    add(m.videoUrl, m.format === 'hls' ? 'HLS STREAM' : 'DIRECT VIDEO', q);
-                  }
-                });
-              }
-            }
-          }
-
-          // 3. xHamster
-          if (window.initials && window.initials.videoModel && window.initials.videoModel.sources) {
-            const s = window.initials.videoModel.sources;
-            if (s.mp4 && typeof s.mp4 === 'object') {
-              for (const [q, u] of Object.entries(s.mp4)) if (typeof u === 'string') add(u, 'DIRECT VIDEO', q);
-            }
-            if (s.hls && typeof s.hls === 'object') {
-              for (const [q, u] of Object.entries(s.hls)) if (typeof u === 'string') add(u, 'HLS STREAM', q);
-            }
-          }
-
-          // 4. HTML5 Video Elements
-          document.querySelectorAll('video').forEach(v => {
-            let s = v.currentSrc || v.src;
-            if (!s) {
-              const sc = v.querySelector('source');
-              if (sc) s = sc.src;
-            }
-            if (!s) {
-              s = v.getAttribute('data-src') || v.getAttribute('data-mediabook');
-            }
-            if (s) add(s, 'HTML5 VIDEO', '');
-          });
-
-          return streams;
-        } catch (e) {
-          return [];
-        }
-      })()
-    `;
-
-    view.webContents.executeJavaScript(script).then(results => {
-      if (Array.isArray(results) && results.length > 0) {
-        const pageTitle = view.webContents.getTitle() || 'Video';
-        for (const item of results) {
-          const payload = {
-            url: item.url,
-            type: item.type,
-            timestamp: Date.now(),
-            title: (item.title && item.title !== 'Video' ? item.title : pageTitle) || 'Video Stream'
-          };
-          const targets = new Set(openWindows);
-          if (mainWindow && !mainWindow.isDestroyed()) targets.add(mainWindow);
-          if (win && !win.isDestroyed()) targets.add(win);
-          for (const targetWin of targets) {
-            if (targetWin && !targetWin.isDestroyed() && targetWin.webContents) {
-              targetWin.webContents.send('video-detected', payload);
-            }
-          }
-        }
-      }
-    }).catch(() => {});
-  }
-
-  // --- CUSTOM SCROLLBAR & CORNERS INJECTION & STREAM EXTRACTION ---
+  // --- CUSTOM SCROLLBAR & CORNERS INJECTION ---
   if (view.webContents) {
     view.webContents.on('dom-ready', () => {
       if (view.webContents) {
@@ -4142,17 +3601,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
             background-color: rgba(153, 153, 153, 0.6) !important;
           }
         `);
-
-        try {
-          extractStreamsFromView(win, view);
-        } catch (e) {}
       }
-    });
-
-    view.webContents.on('did-finish-load', () => {
-      try {
-        extractStreamsFromView(win, view);
-      } catch (e) {}
     });
   }
 
@@ -4212,7 +3661,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
         logStream(`[TAB NAVIGATION BLOCKED] Prevented tab navigating to Ad or Affiliate URL: ${newUrl}`);
         event.preventDefault();
         if (win && !win.isDestroyed() && win.webContents) {
-          win.webContents.send('popup-blocked', {
+          win.webContents.send('video-detected', {
             url: newUrl,
             type: 'POPUP (BLOCKED)',
             timestamp: Date.now(),
@@ -4249,7 +3698,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
                 
                 // Kirim notifikasi ke frontend
                 if (win && !win.isDestroyed() && win.webContents) {
-                  win.webContents.send('popup-blocked', {
+                  win.webContents.send('video-detected', {
                     url: newUrl,
                     type: 'REDIRECT (BLOCKED)',
                     timestamp: Date.now(),
@@ -4271,7 +3720,7 @@ function createSnifferWindow(win, url, bounds, tabId = 'default', background = f
         logStream(`[TAB REDIRECT BLOCKED] Prevented tab redirecting to Ad or Affiliate URL: ${newUrl}`);
         event.preventDefault();
         if (win && !win.isDestroyed() && win.webContents) {
-          win.webContents.send('popup-blocked', {
+          win.webContents.send('video-detected', {
             url: newUrl,
             type: 'POPUP (BLOCKED)',
             timestamp: Date.now(),
@@ -5509,7 +4958,7 @@ ipcMain.on('open-new-tab', (event, url) => {
   if (targetUrl && isUrlAdOrBlocked(targetUrl, true)) {
     logStream(`[OPEN-NEW-TAB BLOCKED] Prevented opening new tab for Ad/Blocked URL: ${targetUrl}`);
     if (win && !win.isDestroyed() && win.webContents) {
-      win.webContents.send('popup-blocked', {
+      win.webContents.send('video-detected', {
         url: targetUrl,
         type: 'POPUP (BLOCKED)',
         timestamp: Date.now(),
@@ -5745,7 +5194,7 @@ ipcMain.on('set-sniffer-mode', (event, isMobile) => {
   const view = getActiveSnifferView(win);
   if (view && view.webContents) {
     const chromeMatch = app.userAgentFallback.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
-    const chromeVersion = chromeMatch ? chromeMatch[1] : '134.0.0.0';
+    const chromeVersion = chromeMatch ? chromeMatch[1] : '116.0.0.0';
     const mobileUA = `Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Mobile Safari/537.36`;
     const desktopUA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
     view.webContents.setUserAgent(isMobile ? mobileUA : desktopUA);
@@ -5762,15 +5211,12 @@ ipcMain.on('set-main-player-referer', (event, referer) => {
 ipcMain.on('set-adblock-enabled', (event, enabled) => {
   adBlockEnabled = enabled;
   logStream(`AdBlock set to: ${enabled}`);
-  if (engineBlocker && app.isReady() && session.defaultSession) {
+  if (engineBlocker) {
     try {
       if (enabled) {
-        enableAdblockInSessionSafe();
+        engineBlocker.enableBlockingInSession(session.defaultSession);
       } else {
-        if (engineBlocker.isBlockingEnabled(session.defaultSession)) {
-          engineBlocker.disableBlockingInSession(session.defaultSession);
-        }
-        setupFallbackHeadersReceived();
+        engineBlocker.disableBlockingInSession(session.defaultSession);
       }
     } catch (e) {
       logStream(`AdBlock toggle error: ${e.message}`);
@@ -5881,7 +5327,7 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
     ffmpeg.setFfmpegPath(ffmpegPath);
 
     const chromeMatch = app.userAgentFallback.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
-    const chromeVersion = chromeMatch ? chromeMatch[1] : '134.0.0.0';
+    const chromeVersion = chromeMatch ? chromeMatch[1] : '116.0.0.0';
     const mobileUA = `Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Mobile Safari/537.36`;
     const desktopUA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
     const userAgent = snifferIsMobile ? mobileUA : desktopUA;
@@ -5891,7 +5337,8 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
       '-rw_timeout 30000000',
       '-user_agent', userAgent,
       '-probesize', '100000000',
-      '-analyzeduration', '100000000'
+      '-analyzeduration', '100000000',
+      '-ignore_unknown'
     ];
 
     let cookiesStr = '';
@@ -5994,6 +5441,62 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
     }
     let tempM3u8Path = null;
 
+    async function resolveM3u8Url(m3u8Url, fetchHeaders) {
+      try {
+        const { net } = require('electron');
+        const response = await net.fetch(m3u8Url, { headers: fetchHeaders, redirect: 'follow' });
+        if (!response.ok) return m3u8Url;
+        const text = await response.text();
+        
+        if (text.includes('#EXT-X-STREAM-INF')) {
+          const lines = text.split(/\r?\n/);
+          let bestVariantUrl = null;
+          let maxBandwidth = -1;
+          let currentBandwidth = 0;
+          let currentCodecs = '';
+
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (line.startsWith('#EXT-X-STREAM-INF:')) {
+              currentBandwidth = 0;
+              currentCodecs = '';
+              const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
+              if (bwMatch) currentBandwidth = parseInt(bwMatch[1], 10);
+              const codecsMatch = line.match(/CODECS="([^"]+)"/i);
+              if (codecsMatch) currentCodecs = codecsMatch[1].toLowerCase();
+            } else if (line && !line.startsWith('#')) {
+              if (!currentCodecs.includes('png') && !currentCodecs.includes('mjpeg') && !line.includes('.image')) {
+                if (currentBandwidth >= maxBandwidth) {
+                  maxBandwidth = currentBandwidth;
+                  bestVariantUrl = line;
+                }
+              }
+            }
+          }
+
+          if (!bestVariantUrl) {
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i].trim();
+              if (line && !line.startsWith('#') && !line.includes('.image')) {
+                bestVariantUrl = line;
+                break;
+              }
+            }
+          }
+
+          if (bestVariantUrl) {
+            const resolved = new URL(bestVariantUrl, m3u8Url).href;
+            logStream(`[DOWNLOAD HLS] Resolved master playlist to variant stream: ${resolved} (Bandwidth: ${maxBandwidth})`);
+            return await resolveM3u8Url(resolved, fetchHeaders);
+          }
+        }
+        return m3u8Url;
+      } catch (e) {
+        logStream(`[DOWNLOAD HLS] Error resolving m3u8 URL: ${e.message}`);
+        return m3u8Url;
+      }
+    }
+
     if (url.includes('.m3u8')) {
       try {
         const { net } = require('electron');
@@ -6070,15 +5573,16 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
         // Fetch dan gabungkan setiap playlist m3u8
         for (const item of sameVideoM3u8s) {
           try {
-            logStream(`[DOWNLOAD HLS] Fetching part: ${item.url}`);
-            const response = await net.fetch(item.url, { headers: fetchHeaders, redirect: 'follow' });
+            const resolvedItemUrl = await resolveM3u8Url(item.url, fetchHeaders);
+            logStream(`[DOWNLOAD HLS] Fetching part: ${resolvedItemUrl}`);
+            const response = await net.fetch(resolvedItemUrl, { headers: fetchHeaders, redirect: 'follow' });
             if (!response.ok) {
-              logStream(`[DOWNLOAD HLS] Skip failed part fetch: ${response.status} for ${item.url}`);
+              logStream(`[DOWNLOAD HLS] Skip failed part fetch: ${response.status} for ${resolvedItemUrl}`);
               continue;
             }
 
             const text = await response.text();
-            const baseUrl = new URL(item.url);
+            const baseUrl = new URL(resolvedItemUrl);
             const lines = text.split('\n');
 
             const partSegments = [];
@@ -6128,11 +5632,13 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
               } else {
                 try {
                   const absoluteUrl = new URL(trimmed, baseUrl).href;
-                  partSegments.push({
-                    url: absoluteUrl,
-                    keyLine: lastKeyLine,
-                    segmentLines: [...currentSegmentLines]
-                  });
+                  if (!absoluteUrl.includes('.m3u8') && !absoluteUrl.includes('.image')) {
+                    partSegments.push({
+                      url: absoluteUrl,
+                      keyLine: lastKeyLine,
+                      segmentLines: [...currentSegmentLines]
+                    });
+                  }
                 } catch (e) {
                   logStream(`[DOWNLOAD] Error parsing segment URL: ${trimmed}, error: ${e.message}`);
                 }
@@ -6151,7 +5657,7 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
 
             const shouldAddDiscontinuity = !isFirstPart && !hasOverlap;
             if (shouldAddDiscontinuity) {
-              logStream(`[DOWNLOAD HLS] Disjoint part detected (no segment overlap), adding EXT-X-DISCONTINUITY for ${item.url}`);
+              logStream(`[DOWNLOAD HLS] Disjoint part detected (no segment overlap), adding EXT-X-DISCONTINUITY for ${resolvedItemUrl}`);
             }
 
             let insertedDiscontinuity = false;
@@ -6198,7 +5704,8 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
           finalUrl = tempM3u8Path;
           logStream(`[DOWNLOAD] Combined ${allSegments.length} segments into local file: ${tempM3u8Path}`);
         } else {
-          logStream(`[DOWNLOAD HLS] No segments found across all parts. Reverting to direct URL download.`);
+          logStream(`[DOWNLOAD HLS] No segments found across all parts. Reverting to resolved URL download.`);
+          finalUrl = await resolveM3u8Url(url, fetchHeaders);
         }
       } catch (e) {
         logStream(`[DOWNLOAD] Error fetching/combining m3u8 manually: ${e.message}`);
@@ -6219,6 +5726,7 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
           message: 'Mencoba transcoding video... Silakan tunggu sebentar~'
         });
         outputOptions = [
+          '-ignore_unknown',
           '-map', '0:v?',
           '-map', '0:a?',
           '-c:v', 'libx264',
@@ -6231,6 +5739,7 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
         ];
       } else {
         outputOptions = [
+          '-ignore_unknown',
           '-map', '0:v?',
           '-map', '0:a?',
           '-c', 'copy',
@@ -6666,6 +6175,8 @@ if (!gotTheLock) {
       });
     } catch (e) {}
 
+    const requestOrigins = new Map();
+
     // Buka celah lebar-lebar buat malsuin header Referer & Origin (VERSI AGRESIF)
     session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
       try {
@@ -6725,21 +6236,7 @@ if (!gotTheLock) {
         // 4. SAMARKAN IDENTITAS BROWSER
         let isSnifferRequest = false;
         let snifferViewUrl = '';
-        for (const win of openWindows) {
-          if (win && !win.isDestroyed() && win.snifferViews) {
-            for (const view of win.snifferViews.values()) {
-              if (view.webContents && details.webContentsId === view.webContents.id) {
-                isSnifferRequest = true;
-                try {
-                  snifferViewUrl = view.webContents.getURL();
-                } catch (e) {}
-                break;
-              }
-            }
-            if (isSnifferRequest) break;
-          }
-        }
-        if (!isSnifferRequest && mainWindow && !mainWindow.isDestroyed() && mainWindow.snifferViews) {
+        if (mainWindow && !mainWindow.isDestroyed() && mainWindow.snifferViews) {
           for (const view of mainWindow.snifferViews.values()) {
             if (view.webContents && details.webContentsId === view.webContents.id) {
               isSnifferRequest = true;
@@ -6766,24 +6263,19 @@ if (!gotTheLock) {
         } else if (!reqHeaders['Referer'] && details.resourceType !== 'main_frame' && !urlStr.includes('cloudflare.com') && !urlStr.includes('turnstile') && !urlStr.includes('google.com')) {
           if (isSnifferRequest && snifferViewUrl && snifferViewUrl.startsWith('http')) {
             reqHeaders['Referer'] = snifferViewUrl;
-            if (details.resourceType === 'media' || reqHeaders['Origin']) {
-              try {
-                const refUrl = new URL(snifferViewUrl);
-                reqHeaders['Origin'] = refUrl.origin;
-              } catch(e) {}
-            }
+            try {
+              const refUrl = new URL(snifferViewUrl);
+              reqHeaders['Origin'] = refUrl.origin;
+            } catch(e) {}
           } else {
             // Gunakan root domain tanpa paksa www. agar lebih kompatibel
             reqHeaders['Referer'] = `https://${rootDomain}/`;
-            if (details.resourceType === 'media' || reqHeaders['Origin']) {
-              reqHeaders['Origin'] = `https://${rootDomain}`;
-            }
+            reqHeaders['Origin'] = `https://${rootDomain}`;
           }
         }
         
         const chromeMatch = app.userAgentFallback.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
-        const chromeVersion = chromeMatch ? chromeMatch[1] : '134.0.0.0';
-        const chromeMajor = chromeVersion.split('.')[0] || '134';
+        const chromeVersion = chromeMatch ? chromeMatch[1] : '116.0.0.0';
         const mobileUA = `Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Mobile Safari/537.36`;
         const desktopUA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Safari/537.36`;
         const firefoxUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0';
@@ -6816,23 +6308,15 @@ if (!gotTheLock) {
           if (snifferIsMobile) {
             reqHeaders['sec-ch-ua-mobile'] = '?1';
             reqHeaders['sec-ch-ua-platform'] = '"Android"';
-            reqHeaders['sec-ch-ua-platform-version'] = '"13.0.0"';
-            reqHeaders['sec-ch-ua-model'] = '"Pixel 7"';
-            reqHeaders['sec-ch-ua'] = `"Google Chrome";v="${chromeMajor}", "Chromium";v="${chromeMajor}", "Not:A-Brand";v="24"`;
-          } else {
-            reqHeaders['sec-ch-ua-mobile'] = '?0';
-            reqHeaders['sec-ch-ua-platform'] = '"Windows"';
-            reqHeaders['sec-ch-ua-platform-version'] = '"15.0.0"';
-            reqHeaders['sec-ch-ua-model'] = '""';
-            reqHeaders['sec-ch-ua'] = `"Google Chrome";v="${chromeMajor}", "Chromium";v="${chromeMajor}", "Not:A-Brand";v="24"`;
+            if (reqHeaders['sec-ch-ua-platform-version']) {
+              reqHeaders['sec-ch-ua-platform-version'] = '"13.0.0"';
+            }
+            if (reqHeaders['sec-ch-ua-model']) {
+              reqHeaders['sec-ch-ua-model'] = '"Pixel 7"';
+            }
           }
         } else {
           reqHeaders['User-Agent'] = desktopUA;
-          reqHeaders['sec-ch-ua-mobile'] = '?0';
-          reqHeaders['sec-ch-ua-platform'] = '"Windows"';
-          reqHeaders['sec-ch-ua-platform-version'] = '"15.0.0"';
-          reqHeaders['sec-ch-ua-model'] = '""';
-          reqHeaders['sec-ch-ua'] = `"Google Chrome";v="${chromeMajor}", "Chromium";v="${chromeMajor}", "Not:A-Brand";v="24"`;
         }
 
         // Clean up sec-ch-ua to remove Electron/App Name globally for non-Google/OAuth requests
@@ -6861,9 +6345,71 @@ if (!gotTheLock) {
       }
     });
 
-    // Aktifkan AdBlocker jika engine sudah siap, atau pasang fallback CORS headers
-    enableAdblockInSessionSafe();
-    setupFallbackHeadersReceived();
+    session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+      try {
+        const urlObj = new URL(details.url);
+        if (urlObj.hostname === 'localhost' || urlObj.hostname === '127.0.0.1') {
+          return callback({ cancel: false, responseHeaders: details.responseHeaders });
+        }
+        
+        const isGoogleOrOauth = 
+          urlObj.hostname.includes('google.com') || 
+          urlObj.hostname.includes('googleusercontent.com') ||
+          urlObj.hostname.includes('googleapis.com') ||
+          urlObj.hostname.includes('youtube.com') ||
+          urlObj.hostname.includes('facebook.com') ||
+          urlObj.hostname.includes('github.com') ||
+          urlObj.hostname.includes('discord.com');
+          
+        if (isGoogleOrOauth) {
+          return callback({ cancel: false, responseHeaders: details.responseHeaders });
+        }
+      } catch (e) {}
+
+      const responseHeaders = { ...details.responseHeaders };
+      
+      let origin = requestOrigins.get(details.id);
+      requestOrigins.delete(details.id);
+
+      if (!origin && details.referrer) {
+        try {
+          origin = new URL(details.referrer).origin;
+        } catch (e) {}
+      }
+
+      // Force CORS headers to allow Web Audio API to process the media
+      const corsHeaders = {
+        'Access-Control-Allow-Methods': ['GET, POST, OPTIONS, PUT, DELETE, PATCH'],
+        'Access-Control-Allow-Headers': ['Content-Type, Range, Authorization, X-Requested-With, Cache-Control, Accept, Origin, Accept-Encoding'],
+        'Access-Control-Expose-Headers': ['Content-Length, Content-Range, Content-Type, Accept-Ranges'],
+      };
+
+      if (origin && origin !== 'null') {
+        corsHeaders['Access-Control-Allow-Origin'] = [origin];
+        corsHeaders['Access-Control-Allow-Credentials'] = ['true'];
+      } else {
+        corsHeaders['Access-Control-Allow-Origin'] = ['*'];
+        delete responseHeaders['Access-Control-Allow-Credentials'];
+        delete responseHeaders['access-control-allow-credentials'];
+      }
+
+      Object.keys(corsHeaders).forEach(key => {
+        responseHeaders[key] = corsHeaders[key];
+      });
+
+      // Remove X-Frame-Options to allow embedding if needed
+      delete responseHeaders['X-Frame-Options'];
+      delete responseHeaders['x-frame-options'];
+      delete responseHeaders['Content-Security-Policy'];
+
+      const isOptions = details.method === 'OPTIONS';
+      const responseData = { cancel: false, responseHeaders };
+      if (isOptions) {
+        responseData.statusLine = 'HTTP/1.1 200 OK';
+      }
+
+      callback(responseData);
+    });
 
     // --- TAMBAHAN LOGGING STREAM BIKINAN AKU ---
     session.defaultSession.webRequest.onResponseStarted((details) => {
@@ -6871,18 +6417,13 @@ if (!gotTheLock) {
       
       const url = details.url.toLowerCase();
       
-      // Filter ketat: Abaikan gambar, thumbnail, dan iklan
+      // Filter ketat: Abaikan gambar, thumbnail, preview singkat, dan iklan
       const isImage = details.resourceType === 'image' || url.match(/\.(jpg|jpeg|png|gif|webp|svg|ico)(\?|$)/);
       const isPreview = url.match(/(preview|thumb|storyboard|sprite|teaser|trailer|promo|sample|short)/) && 
                         !url.includes('spankbang') && 
                         !url.includes('sb-preview') &&
-                        !url.includes('sb-cd') &&
-                        !url.includes('phncdn') &&
-                        !url.includes('portalcdn') &&
-                        !url.includes('xhcdn') &&
-                        !url.includes('xhpingcdn') &&
                         !url.match(/\.(mp4|m3u8|webm)(\?|$)/);
-      const isAd = !url.match(/\.(mp4|m3u8|mpd|webm)(\?|$)/) && url.match(/(\/ads\/|\/adserver\/|doubleclick|googleadservices|googlesyndication|popads|popcash|exoclick|adsterra|propeller)/);
+      const isAd = url.match(/(\/ads\/|ad-|tracker|banner|popunder|vast|vmap|adserver|analytics)/);
       
       if (isImage || isPreview || isAd) return;
 
@@ -6906,39 +6447,22 @@ if (!gotTheLock) {
       const isDashContentType = contentType.includes('dash+xml');
       const isVideoContentType = contentType.startsWith('video/');
 
-      const isKnownVideoCdn = url.includes('sb-cd.com') || 
-                              url.includes('sb-preview') || 
-                              url.includes('spankbang') || 
-                              url.includes('phncdn.com') || 
-                              url.includes('pornhub') || 
-                              url.includes('portalcdn.com') ||
-                              url.includes('xhcdn.com') || 
-                              url.includes('xhpingcdn.com') ||
-                              url.includes('xhamster') ||
-                              url.includes('googlevideo.com');
-
       const isMainStream = (url.includes('.m3u8') || url.includes('/m3u8/') || url.includes('.mpd') || isM3u8ContentType || isDashContentType) && !url.match(/\.(ts|m4s|vtt)(\?|$)/);
-      const isDirectVideo = (details.resourceType === 'media' || url.match(/\.(mp4|webm|mov|avi)(\?|$)/) || isVideoContentType || (isKnownVideoCdn && !isImage && (details.resourceType === 'media' || details.resourceType === 'xhr' || details.resourceType === 'fetch'))) && !url.match(/\.(ts|m4s|vtt)(\?|$)/);
+      const isDirectVideo = (details.resourceType === 'media' || url.match(/\.(mp4|webm|mov|avi)(\?|$)/) || isVideoContentType) && !url.match(/\.(ts|m4s|vtt)(\?|$)/);
 
-      if (isMainStream || isDirectVideo) {
+      if ((isMainStream || isDirectVideo) && mainWindow && !mainWindow.isDestroyed()) {
+        // Abaikan file video yang ukurannya terlalu kecil (kemungkinan preview/iklan) < 2MB
         let contentLength = 0;
         if (details.responseHeaders) {
           const clHeader = details.responseHeaders['Content-Length'] || details.responseHeaders['content-length'];
           if (clHeader && clHeader.length > 0) {
             contentLength = parseInt(clHeader[0], 10);
           }
-          const crHeader = details.responseHeaders['Content-Range'] || details.responseHeaders['content-range'];
-          if (crHeader && crHeader.length > 0) {
-            const rangeMatch = crHeader[0].match(/\/(\d+)/);
-            if (rangeMatch) {
-              contentLength = parseInt(rangeMatch[1], 10);
-            }
-          }
         }
 
-        // Jangan buang media request atau chunk dari video CDN terkenal (sb-cd, phncdn, xhcdn) hanya karena partial Range request
-        const hasRangeHeader = !!(details.responseHeaders && (details.responseHeaders['Content-Range'] || details.responseHeaders['content-range'] || details.responseHeaders['Accept-Ranges'] || details.responseHeaders['accept-ranges']));
-        if (!isMainStream && !isKnownVideoCdn && details.resourceType !== 'media' && !hasRangeHeader && contentLength > 0 && contentLength < 100 * 1024) {
+        // Jika direct video (bukan stream) dan ukurannya kurang dari 2MB, abaikan (kemungkinan preview)
+        if (!isMainStream && isDirectVideo && contentLength > 0 && contentLength < 2 * 1024 * 1024) {
+          logStream(`[IGNORED SMALL VIDEO] ${details.url} (${Math.round(contentLength/1024)} KB)`);
           return;
         }
 
@@ -6947,39 +6471,15 @@ if (!gotTheLock) {
         const resolutionStr = resMatch ? ` [${resMatch[1]}]` : '';
         
         logStream(`[SNIFFER] Video detected: ${details.url}`);
-
-        let detectedTitle = 'Unknown Video';
-        for (const win of openWindows) {
-          if (win && !win.isDestroyed() && win.snifferViews) {
-            for (const view of win.snifferViews.values()) {
-              if (view.webContents && view.webContents.id === details.webContentsId) {
-                detectedTitle = view.webContents.getTitle() || detectedTitle;
-                break;
-              }
-            }
-          }
-        }
-        if (detectedTitle === 'Unknown Video') {
-          const activeView = getActiveSnifferView();
-          if (activeView && activeView.webContents) {
-            detectedTitle = activeView.webContents.getTitle() || detectedTitle;
-          }
-        }
-
-        const videoPayload = {
-          url: details.url,
-          type: (isMainStream ? 'HLS/DASH STREAM' : 'DIRECT VIDEO') + resolutionStr,
-          timestamp: Date.now(),
-          size: contentLength > 0 ? `${(contentLength / (1024 * 1024)).toFixed(2)} MB` : undefined,
-          title: detectedTitle
-        };
-
-        const targets = new Set(openWindows);
-        if (mainWindow && !mainWindow.isDestroyed()) targets.add(mainWindow);
-        for (const win of targets) {
-          if (win && !win.isDestroyed() && win.webContents) {
-            win.webContents.send('video-detected', videoPayload);
-          }
+        if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+            const activeView = getActiveSnifferView();
+            mainWindow.webContents.send('video-detected', {
+            url: details.url,
+            type: (isMainStream ? 'HLS/DASH STREAM' : 'DIRECT VIDEO') + resolutionStr,
+            timestamp: Date.now(),
+            size: contentLength > 0 ? `${(contentLength / (1024 * 1024)).toFixed(2)} MB` : undefined,
+            title: activeView && activeView.webContents ? activeView.webContents.getTitle() : 'Unknown Video'
+          });
         }
       }
 

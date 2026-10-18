@@ -408,57 +408,72 @@ export const usePlayer = (videoRef: React.RefObject<HTMLVideoElement | null>, in
       const isM3U8 = videoSrc.includes('.m3u8') || (originalVideoSrc && originalVideoSrc.includes('.m3u8'));
 
       if (isM3U8) {
-        setIsCheckingStream(false);
+        setIsCheckingStream(true);
         setVideoError(null);
 
-        if (Hls.isSupported()) {
-          try {
-            const hls = new Hls({
-              maxMaxBufferLength: 30, // Limit buffer size to be super responsive
-              enableWorker: true,
-              lowLatencyMode: true,
-            });
-            hls.loadSource(videoSrc);
-            hls.attachMedia(videoRef.current);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
-              if (videoRef.current) {
-                videoRef.current.play().catch(e => {
-                  console.warn("HLS play after manifest parsed failed:", e);
-                });
-              }
-            });
-            hls.on(Hls.Events.ERROR, (_event, data) => {
-              if (data.fatal) {
-                switch (data.type) {
-                  case Hls.ErrorTypes.NETWORK_ERROR:
-                    console.warn('Fatal HLS network error, attempting reload...', data);
-                    hls.startLoad();
-                    break;
-                  case Hls.ErrorTypes.MEDIA_ERROR:
-                    console.warn('Fatal HLS media error, recovering...', data);
-                    hls.recoverMediaError();
-                    break;
-                  default:
-                    console.error('Fatal unrecoverable HLS error:', data);
-                    hls.destroy();
-                    setVideoError(t('streamUnreachable', currentLanguage));
-                    setIsPlaying(false);
-                    break;
-                }
-              }
-            });
-            hlsPlayerRef.current = hls;
-          } catch (e) {
-            console.error("Hls error", e);
+        checkStreamAvailability(videoSrc).then((available) => {
+          if (isCancelled) return;
+          setIsCheckingStream(false);
+
+          if (!available) {
+            setVideoError(t('streamUnreachable', currentLanguage));
+            setIsPlaying(false);
             if (videoRef.current) {
-              videoRef.current.src = videoSrc;
+              videoRef.current.removeAttribute('src');
               videoRef.current.load();
             }
+            return;
           }
-        } else if (videoRef.current) {
-          videoRef.current.src = videoSrc;
-          videoRef.current.load();
-        }
+
+          if (Hls.isSupported()) {
+            try {
+              const hls = new Hls({
+                maxMaxBufferLength: 30, // Limit buffer size to be super responsive
+                enableWorker: true,
+                lowLatencyMode: true,
+              });
+              hls.loadSource(videoSrc);
+              hls.attachMedia(videoRef.current);
+              hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                if (isPlaying && videoRef.current) {
+                  videoRef.current.play().catch(() => {});
+                }
+              });
+              hls.on(Hls.Events.ERROR, (_event, data) => {
+                if (data.fatal) {
+                  switch (data.type) {
+                    case Hls.ErrorTypes.NETWORK_ERROR:
+                      console.warn('Fatal HLS network error, attempting reload...', data);
+                      hls.startLoad();
+                      break;
+                    case Hls.ErrorTypes.MEDIA_ERROR:
+                      console.warn('Fatal HLS media error, recovering...', data);
+                      hls.recoverMediaError();
+                      break;
+                    default:
+                      console.error('Fatal unrecoverable HLS error:', data);
+                      hls.destroy();
+                      setVideoError(t('streamUnreachable', currentLanguage));
+                      setIsPlaying(false);
+                      break;
+                  }
+                }
+              });
+              hlsPlayerRef.current = hls;
+            } catch (e) {
+              console.error("Hls error", e);
+              if (videoRef.current) {
+                videoRef.current.src = videoSrc;
+                videoRef.current.load();
+                if (isPlaying) videoRef.current.play().catch(() => {});
+              }
+            }
+          } else if (videoRef.current) {
+            videoRef.current.src = videoSrc;
+            videoRef.current.load();
+            if (isPlaying) videoRef.current.play().catch(() => {});
+          }
+        });
       } else if ((videoSrc.endsWith('.ts') || videoSrc.includes('.ts?')) && mpegts.isSupported()) {
         try {
           const player = mpegts.createPlayer({
@@ -468,22 +483,24 @@ export const usePlayer = (videoRef: React.RefObject<HTMLVideoElement | null>, in
           });
           player.attachMediaElement(videoRef.current);
           player.load();
-          player.play();
           mpegtsPlayerRef.current = player;
+          if (isPlaying && videoRef.current) {
+            videoRef.current.play().catch(() => {});
+          }
         } catch (e) {
           console.error("mpegts error", e);
           videoRef.current.src = videoSrc;
           videoRef.current.load();
+          if (isPlaying && videoRef.current) {
+            videoRef.current.play().catch(() => {});
+          }
         }
       } else {
         videoRef.current.src = videoSrc;
         videoRef.current.load();
-        const handleCanPlay = () => {
-          if (videoRef.current) {
-            videoRef.current.play().catch(console.warn);
-          }
-        };
-        videoRef.current.addEventListener('canplay', handleCanPlay, { once: true });
+        if (isPlaying && videoRef.current) {
+          videoRef.current.play().catch(() => {});
+        }
       }
     } else {
       videoRef.current.removeAttribute('src');
@@ -512,6 +529,30 @@ export const usePlayer = (videoRef: React.RefObject<HTMLVideoElement | null>, in
       cleanupAudioContext();
     };
   }, [videoSrc, videoRef, currentLanguage, checkStreamAvailability]); // eslint-disable-next-line react-hooks/exhaustive-deps
+
+  // Auto-play when video is ready/canplay if isPlaying is true
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    if (!videoEl) return;
+
+    const handleReadyToPlay = () => {
+      if (isPlaying && videoEl.paused && videoEl.src) {
+        videoEl.play().catch(e => {
+          if (e.name !== 'AbortError') {
+            console.warn("Auto-play on ready failed:", e);
+          }
+        });
+      }
+    };
+
+    videoEl.addEventListener('canplay', handleReadyToPlay);
+    videoEl.addEventListener('loadedmetadata', handleReadyToPlay);
+
+    return () => {
+      videoEl.removeEventListener('canplay', handleReadyToPlay);
+      videoEl.removeEventListener('loadedmetadata', handleReadyToPlay);
+    };
+  }, [isPlaying, videoRef]);
 
   // Force sound on source change
   useEffect(() => {
