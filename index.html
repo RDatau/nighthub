@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NightHUB Player</title>
+    <meta name="description" content="A clean, minimalist, dark-themed local video player with advanced sniffing and recording features." />
+    <meta property="og:title" content="NightHUB Player" />
+    <meta property="og:description" content="A clean, minimalist, dark-themed local video player with advanced sniffing and recording features." />
+    <script>
+      (function() {
+        try {
+          var originalFetch = window.fetch;
+          if (typeof originalFetch === 'function') {
+            Object.defineProperty(window, 'fetch', {
+              get: function() {
+                return originalFetch;
+              },
+              set: function(newFetch) {
+                originalFetch = newFetch;
+              },
+              configurable: true,
+              enumerable: true
+            });
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        background-color: transparent !important;
+      }
+      #root {
+        background-color: transparent !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
