@@ -5497,219 +5497,186 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
       }
     }
 
+    // Simplified HLS download logic: Pass the resolved playlist URL directly to FFmpeg.
+    // FFmpeg's native HLS implementation is more robust than manual concatenation.
     if (url.includes('.m3u8')) {
+      finalUrl = await resolveM3u8Url(url, {
+        'User-Agent': userAgent,
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+        ...(spoofedReferer && { 'Referer': spoofedReferer }),
+        ...(cookiesStr && { 'Cookie': cookiesStr })
+      });
+      logStream(`[DOWNLOAD HLS] Using resolved master/variant playlist: ${finalUrl}`);
+    }
+
+    // Check if this HLS stream consists of image segments (e.g. TikTok photo slideshows with .image segments)
+    let isImageHls = false;
+    try {
+      const { net } = require('electron');
+      const resp = await net.fetch(finalUrl, {
+        headers: {
+          'User-Agent': userAgent,
+          ...(spoofedReferer && { 'Referer': spoofedReferer }),
+          ...(cookiesStr && { 'Cookie': cookiesStr })
+        },
+        redirect: 'follow'
+      });
+      if (resp.ok) {
+        const txt = await resp.text();
+        if (txt.includes('.image') || txt.includes('.png') || txt.includes('.jpg')) {
+          isImageHls = true;
+        }
+      }
+    } catch (e) {}
+
+    if (isImageHls) {
+      logStream(`[DOWNLOAD HLS] Detected image-based HLS stream (slideshow/images). Downloading frames...`);
+      event.reply('download-progress', { url, status: 'starting', percent: 10, message: 'Mengunduh slide foto TikTok...' });
+      
       try {
         const { net } = require('electron');
-        const fetchHeaders = {
-          'User-Agent': userAgent,
-          'Accept': '*/*',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Connection': 'keep-alive',
-        };
-        if (spoofedReferer) {
-          fetchHeaders['Referer'] = spoofedReferer;
-          try { fetchHeaders['Origin'] = new URL(spoofedReferer).origin; } catch(e){}
-        }
-        if (cookiesStr) {
-          fetchHeaders['Cookie'] = cookiesStr;
-        }
+        const resp = await net.fetch(finalUrl, {
+          headers: {
+            'User-Agent': userAgent,
+            ...(spoofedReferer && { 'Referer': spoofedReferer }),
+            ...(cookiesStr && { 'Cookie': cookiesStr })
+          },
+          redirect: 'follow'
+        });
+        const playlistText = await resp.text();
+        const baseUrl = new URL(finalUrl);
+        const lines = playlistText.split('\n');
+        const imageUrls = [];
 
-        // 1. Temukan semua m3u8 yang berasal dari video yang sama
-        const sameVideoM3u8s = [];
-        if (allDetectedM3u8s && Array.isArray(allDetectedM3u8s)) {
-          // Fungsi pembanding kesamaan video
-          const areUrlsFromSameVideo = (url1, url2) => {
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed && !trimmed.startsWith('#')) {
             try {
-              const u1 = new URL(url1);
-              const u2 = new URL(url2);
-              if (u1.hostname !== u2.hostname) return false;
-              
-              const p1 = u1.pathname;
-              const p2 = u2.pathname;
-              if (p1 === p2) return true;
-              
-              const dir1 = p1.substring(0, p1.lastIndexOf('/'));
-              const dir2 = p2.substring(0, p2.lastIndexOf('/'));
-              if (dir1 !== dir2) return false;
-              
-              const resolutions = ['1080', '720', '480', '360', '240'];
-              for (const res of resolutions) {
-                const has1 = url1.includes(res);
-                const has2 = url2.includes(res);
-                if (has1 !== has2) return false;
-              }
-              return true;
-            } catch (e) {
-              return false;
-            }
-          };
-
-          // Filter yang serupa dengan clicked url
-          allDetectedM3u8s.forEach(item => {
-            if (item && item.url && areUrlsFromSameVideo(url, item.url)) {
-              if (!sameVideoM3u8s.some(x => x.url === item.url)) {
-                sameVideoM3u8s.push(item);
-              }
-            }
-          });
-
-          // Urutkan berdasarkan timestamp ascending (Part 1, Part 2, Part 3...)
-          sameVideoM3u8s.sort((a, b) => a.timestamp - b.timestamp);
-        }
-
-        // Jika tidak ada m3u8 lain, gunakan yang di-klik saja
-        if (sameVideoM3u8s.length === 0) {
-          sameVideoM3u8s.push({ url, timestamp: Date.now() });
-        }
-
-        logStream(`[DOWNLOAD HLS] Combining ${sameVideoM3u8s.length} parts of the video stream...`);
-
-        const allSegments = [];
-        const addedSegmentUrls = new Set();
-        let targetDuration = 10;
-        let version = 3;
-        let isFirstPart = true;
-
-        // Fetch dan gabungkan setiap playlist m3u8
-        for (const item of sameVideoM3u8s) {
-          try {
-            const resolvedItemUrl = await resolveM3u8Url(item.url, fetchHeaders);
-            logStream(`[DOWNLOAD HLS] Fetching part: ${resolvedItemUrl}`);
-            const response = await net.fetch(resolvedItemUrl, { headers: fetchHeaders, redirect: 'follow' });
-            if (!response.ok) {
-              logStream(`[DOWNLOAD HLS] Skip failed part fetch: ${response.status} for ${resolvedItemUrl}`);
-              continue;
-            }
-
-            const text = await response.text();
-            const baseUrl = new URL(resolvedItemUrl);
-            const lines = text.split('\n');
-
-            const partSegments = [];
-            let currentSegmentLines = [];
-            let lastKeyLine = null;
-
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed) continue;
-
-              // Parse global header values if available
-              if (trimmed.startsWith('#EXT-X-TARGETDURATION:')) {
-                const durVal = parseInt(trimmed.split(':')[1], 10);
-                if (!isNaN(durVal) && durVal > targetDuration) targetDuration = durVal;
-                continue;
-              }
-              if (trimmed.startsWith('#EXT-X-VERSION:')) {
-                const verVal = parseInt(trimmed.split(':')[1], 10);
-                if (!isNaN(verVal)) version = verVal;
-                continue;
-              }
-
-              if (trimmed.startsWith('#EXTM3U') || 
-                  trimmed.startsWith('#EXT-X-MEDIA-SEQUENCE') || 
-                  trimmed.startsWith('#EXT-X-PLAYLIST-TYPE') || 
-                  trimmed.startsWith('#EXT-X-ALLOW-CACHE') || 
-                  trimmed.startsWith('#EXT-X-INDEPENDENT-SEGMENTS') || 
-                  trimmed.startsWith('#EXT-X-ENDLIST')) {
-                continue;
-              }
-
-              if (trimmed.startsWith('#EXT-X-KEY:')) {
-                let resolvedKeyLine = trimmed;
-                try {
-                  const uriMatch = trimmed.match(/URI="([^"]+)"/);
-                  if (uriMatch) {
-                    const absoluteUri = new URL(uriMatch[1], baseUrl).href;
-                    resolvedKeyLine = trimmed.replace(`URI="${uriMatch[1]}"`, `URI="${absoluteUri}"`);
-                  }
-                } catch (e) {}
-                lastKeyLine = resolvedKeyLine;
-                continue;
-              }
-
-              if (trimmed.startsWith('#')) {
-                currentSegmentLines.push(trimmed);
-              } else {
-                try {
-                  const absoluteUrl = new URL(trimmed, baseUrl).href;
-                  if (!absoluteUrl.includes('.m3u8') && !absoluteUrl.includes('.image')) {
-                    partSegments.push({
-                      url: absoluteUrl,
-                      keyLine: lastKeyLine,
-                      segmentLines: [...currentSegmentLines]
-                    });
-                  }
-                } catch (e) {
-                  logStream(`[DOWNLOAD] Error parsing segment URL: ${trimmed}, error: ${e.message}`);
-                }
-                currentSegmentLines = [];
-              }
-            }
-
-            // Cek overlap untuk menentukan apakah ini disjoint part (bagian terpisah dengan timeline PTS baru)
-            let hasOverlap = false;
-            for (const seg of partSegments) {
-              if (addedSegmentUrls.has(seg.url)) {
-                hasOverlap = true;
-                break;
-              }
-            }
-
-            const shouldAddDiscontinuity = !isFirstPart && !hasOverlap;
-            if (shouldAddDiscontinuity) {
-              logStream(`[DOWNLOAD HLS] Disjoint part detected (no segment overlap), adding EXT-X-DISCONTINUITY for ${resolvedItemUrl}`);
-            }
-
-            let insertedDiscontinuity = false;
-            for (const seg of partSegments) {
-              if (!addedSegmentUrls.has(seg.url)) {
-                addedSegmentUrls.add(seg.url);
-
-                const entryLines = [];
-                if (shouldAddDiscontinuity && !insertedDiscontinuity) {
-                  entryLines.push('#EXT-X-DISCONTINUITY');
-                  insertedDiscontinuity = true;
-                }
-                if (seg.keyLine) {
-                  entryLines.push(seg.keyLine);
-                }
-                entryLines.push(...seg.segmentLines);
-                entryLines.push(seg.url);
-
-                allSegments.push(entryLines.join('\n'));
-              }
-            }
-
-            if (partSegments.length > 0) {
-              isFirstPart = false;
-            }
-          } catch (partError) {
-            logStream(`[DOWNLOAD HLS] Error fetching/parsing part ${item.url}: ${partError.message}`);
+              const absUrl = new URL(trimmed, baseUrl).href;
+              imageUrls.push(absUrl);
+            } catch (e) {}
           }
         }
 
-        if (allSegments.length > 0) {
-          // Bangun file m3u8 tunggal yang tergabung
-          const combinedM3u8Content = [
-            '#EXTM3U',
-            `#EXT-X-VERSION:${version}`,
-            `#EXT-X-TARGETDURATION:${targetDuration}`,
-            '#EXT-X-MEDIA-SEQUENCE:0',
-            ...allSegments,
-            '#EXT-X-ENDLIST'
-          ].join('\n');
+        if (imageUrls.length > 0) {
+          const fs = require('fs');
+          const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nighthub-slides-'));
+          logStream(`[DOWNLOAD HLS] Downloading ${imageUrls.length} image frames to ${tempDir}`);
 
-          tempM3u8Path = path.join(os.tmpdir(), `local_combined_${Date.now()}.m3u8`);
-          require('fs').writeFileSync(tempM3u8Path, combinedM3u8Content);
-          finalUrl = tempM3u8Path;
-          logStream(`[DOWNLOAD] Combined ${allSegments.length} segments into local file: ${tempM3u8Path}`);
-        } else {
-          logStream(`[DOWNLOAD HLS] No segments found across all parts. Reverting to resolved URL download.`);
-          finalUrl = await resolveM3u8Url(url, fetchHeaders);
+          for (let i = 0; i < imageUrls.length; i++) {
+            try {
+              const imgResp = await net.fetch(imageUrls[i], {
+                headers: {
+                  'User-Agent': userAgent,
+                  ...(spoofedReferer && { 'Referer': spoofedReferer }),
+                  ...(cookiesStr && { 'Cookie': cookiesStr })
+                }
+              });
+              if (imgResp.ok) {
+                const buffer = Buffer.from(await imgResp.arrayBuffer());
+                const frameName = `frame_${String(i + 1).padStart(3, '0')}.png`;
+                fs.writeFileSync(path.join(tempDir, frameName), buffer);
+              }
+            } catch (imgErr) {
+              logStream(`[DOWNLOAD HLS] Failed to download frame ${i}: ${imgErr.message}`);
+            }
+            const pct = Math.floor(10 + (i / imageUrls.length) * 50);
+            event.reply('download-progress', { url, status: 'downloading', percent: pct, message: `Mengunduh frame ${i + 1}/${imageUrls.length}...` });
+          }
+
+          logStream(`[DOWNLOAD HLS] Frames downloaded successfully. Compiling into MP4 video...`);
+          event.reply('download-progress', { url, status: 'downloading', percent: 65, message: 'Mengonversi gambar menjadi video MP4...' });
+
+          const pattern = path.join(tempDir, 'frame_%03d.png').replace(/\\/g, '/');
+          
+          await new Promise((resolve, reject) => {
+            ffmpeg()
+              .input(pattern)
+              .inputOptions(['-framerate 0.5']) // 2 seconds per photo slide
+              .outputOptions([
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-r', '25',
+                '-movflags', '+faststart'
+              ])
+              .output(filePath)
+              .on('start', (cmd) => logStream(`[FFMPEG SLIDESHOW] Started: ${cmd}`))
+              .on('progress', (prog) => {
+                event.reply('download-progress', {
+                  url,
+                  status: 'downloading',
+                  percent: 65 + Math.min(30, Math.floor((prog.percent || 0) * 0.3)),
+                  timemark: prog.timemark
+                });
+              })
+              .on('end', () => {
+                try {
+                  fs.rmSync(tempDir, { recursive: true, force: true });
+                } catch (e) {}
+                logStream(`[DOWNLOAD HLS] Slideshow video compiled successfully: ${filePath}`);
+                event.reply('download-progress', { url, status: 'completed', filePath });
+                resolve(true);
+              })
+              .on('error', (err, stdout, stderr) => {
+                try {
+                  fs.rmSync(tempDir, { recursive: true, force: true });
+                } catch (e) {}
+                reject(err);
+              })
+              .run();
+          });
+
+          if (tabId) decrementDownloadTab(tabId);
+          return;
         }
-      } catch (e) {
-        logStream(`[DOWNLOAD] Error fetching/combining m3u8 manually: ${e.message}`);
+      } catch (slideErr) {
+        logStream(`[DOWNLOAD HLS] Slideshow fallback error: ${slideErr.message}`);
       }
+    }
+
+    // --- STREAM HEADER ANALYZER (FFPROBE) ---
+    let videoStreamIndex = '0:v?';
+    try {
+      const ffprobeInstaller = require('@ffprobe-installer/ffprobe');
+      let ffprobePath = ffprobeInstaller.path;
+      if (ffprobePath.includes('app.asar')) {
+        ffprobePath = ffprobePath.replace('app.asar', 'app.asar.unpacked');
+      }
+      ffmpeg.setFfprobePath(ffprobePath);
+
+      logStream(`[FFPROBE] Analyzing stream headers for: ${finalUrl}`);
+      const probeData = await new Promise((resolve, reject) => {
+        ffmpeg.ffprobe(finalUrl, {
+          inputOptions: inputOptions
+        }, (err, data) => {
+          if (err) reject(err);
+          else resolve(data);
+        });
+      });
+
+      if (probeData && probeData.streams) {
+        logStream(`[FFPROBE] Analyzed successfully. Total streams: ${probeData.streams.length}`);
+        const videoStreams = probeData.streams.filter(s => s.codec_type === 'video');
+        
+        const validVideoStreams = videoStreams.filter(s => {
+          const codec = (s.codec_name || '').toLowerCase();
+          const pixFmt = (s.pix_fmt || '').toLowerCase();
+          return codec !== 'png' && codec !== 'mjpeg' && !pixFmt.includes('png');
+        });
+
+        if (validVideoStreams.length > 0) {
+          const bestStream = validVideoStreams[0];
+          videoStreamIndex = `0:${bestStream.index}`;
+          logStream(`[FFPROBE] Identified valid video stream -> Index: ${bestStream.index}, Codec: ${bestStream.codec_name}, Width: ${bestStream.width}, Height: ${bestStream.height}, FPS: ${bestStream.r_frame_rate}`);
+        } else if (videoStreams.length > 0) {
+          videoStreamIndex = `0:${videoStreams[0].index}`;
+          logStream(`[FFPROBE WARNING] Only image/unknown video streams found, using stream index ${videoStreams[0].index}`);
+        }
+      }
+    } catch (probeErr) {
+      logStream(`[FFPROBE ERROR] Failed to analyze stream headers: ${probeErr.message}. Falling back to default 0:v?`);
     }
 
     const startFFmpegDownload = (isFallback) => {
@@ -5727,7 +5694,7 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
         });
         outputOptions = [
           '-ignore_unknown',
-          '-map', '0:v?',
+          '-map', videoStreamIndex,
           '-map', '0:a?',
           '-c:v', 'libx264',
           '-preset', 'ultrafast',
@@ -5740,7 +5707,7 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
       } else {
         outputOptions = [
           '-ignore_unknown',
-          '-map', '0:v?',
+          '-map', videoStreamIndex,
           '-map', '0:a?',
           '-c', 'copy',
           '-bsf:a', 'aac_adtstoasc',
