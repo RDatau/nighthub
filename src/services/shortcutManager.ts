@@ -331,6 +331,12 @@ export const DEFAULT_COMMANDS: CommandDefinition[] = [
     category: 'display',
     defaultKeys: [],
   },
+  {
+    id: 'toggleAllControls',
+    nameKey: 'shortcutToggleAllControls',
+    category: 'display',
+    defaultKeys: [],
+  },
 
   // ==========================================
   // 5. A-B Repeat, Penanda & Trim (Markers)

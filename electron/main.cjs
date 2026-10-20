@@ -5336,8 +5336,11 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
       '-protocol_whitelist file,http,https,tcp,tls,crypto',
       '-rw_timeout 30000000',
       '-user_agent', userAgent,
-      '-probesize', '100000000',
-      '-analyzeduration', '100000000',
+      '-probesize', '50M',
+      '-analyzeduration', '50M',
+      '-fflags', '+genpts+igndts',
+      '-use_wallclock_as_timestamps', '1',
+      '-r', '25',
       '-ignore_unknown'
     ];
 
@@ -5477,7 +5480,7 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
           if (!bestVariantUrl) {
             for (let i = 0; i < lines.length; i++) {
               const line = lines[i].trim();
-              if (line && !line.startsWith('#') && !line.includes('.image')) {
+              if (line && !line.startsWith('#')) {
                 bestVariantUrl = line;
                 break;
               }
@@ -5699,6 +5702,7 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
           '-c:v', 'libx264',
           '-preset', 'ultrafast',
           '-pix_fmt', 'yuv420p',
+          '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
           '-c:a', 'aac',
           '-b:a', '128k',
           '-max_muxing_queue_size', '9999',

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { Play, Pause, Square, Volume2, VolumeX, Maximize, Minimize, FileVideo, ListVideo, MessageSquare, Settings, Repeat, X, Plus, Gauge, Info, Subtitles, Search, Save, Download, Link, Camera, Video, Shuffle, Repeat1, LayoutGrid, List, BookmarkPlus, MapPin, Trash2, FolderOpen, PictureInPicture2, AlertCircle, CheckCircle2, Move } from 'lucide-react';
+import { Play, Pause, Square, Volume2, VolumeX, Maximize, Minimize, FileVideo, ListVideo, MessageSquare, Settings, Repeat, X, Plus, Gauge, Info, Subtitles, Search, Save, Download, Link, Camera, Video, Shuffle, Repeat1, LayoutGrid, List, BookmarkPlus, MapPin, Trash2, FolderOpen, PictureInPicture2, AlertCircle, CheckCircle2, Move, Eye, EyeOff } from 'lucide-react';
 import MediaInfoFactory from 'mediainfo.js';
 
 import { DragOverlay } from './components/DragOverlay';
@@ -238,6 +238,7 @@ export default function App() {
   // UI States
   const [showPlayer, setShowPlayer] = useState(true);
   const [showControls, setShowControls] = useState(true);
+  const [isControlsManuallyHidden, setIsControlsManuallyHidden] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [enableAIFeatures, setEnableAIFeatures] = useState<boolean>(() => {
     if (typeof localStorage !== 'undefined') {
@@ -3699,6 +3700,16 @@ export default function App() {
         }
         return;
       }
+
+      if (matchesCommand(e, 'toggleAllControls')) {
+        e.preventDefault();
+        setIsControlsManuallyHidden(prev => {
+          const next = !prev;
+          showFeedback(next ? (preferenceSettings.language === 'id' ? 'Kontrol disembunyikan' : 'Controls hidden') : (preferenceSettings.language === 'id' ? 'Kontrol ditampilkan' : 'Controls shown'));
+          return next;
+        });
+        return;
+      }
     };
 
     const handleClick = () => {
@@ -4946,7 +4957,7 @@ export default function App() {
           )}
 
           {/* Controls Overlay */}
-          <div className={`absolute inset-0 pointer-events-none transition-opacity duration-700 z-30 ${showControls ? 'opacity-100' : 'opacity-0'}`}>
+          <div className={`absolute inset-0 pointer-events-none transition-opacity duration-700 z-30 ${showControls && !isControlsManuallyHidden ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
             
             <TopControls
               onMinimize={async () => {
@@ -4995,6 +5006,8 @@ export default function App() {
               showAILive={showAILive}
               onToggleAILive={() => setShowAILive(!showAILive)}
               enableAIFeatures={enableAIFeatures}
+              onToggleControlsHidden={() => setIsControlsManuallyHidden(prev => !prev)}
+              isControlsHidden={isControlsManuallyHidden}
             />
 
             {/* Bottom Bar (Floating Pill) */}
@@ -5121,6 +5134,19 @@ export default function App() {
               onShowAudioSettings={() => setShowAudioSettings(true)}
             />
           </div>
+
+          {/* Floating Show/Hide Controls Toggle Button when controls are hidden (Auto Hide on mouse movement) */}
+          {isControlsManuallyHidden && (
+            <div className={`absolute ${appearanceSettings?.displayMode === 'compact' ? 'left-0' : 'left-2 sm:left-6'} top-1/2 transform -translate-y-1/2 z-40 pointer-events-auto transition-opacity duration-300 ${showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+              <button
+                onClick={() => setIsControlsManuallyHidden(false)}
+                className={`w-10 h-10 sm:w-12 sm:h-12 flex items-center justify-center transition-all duration-300 group ${appearanceSettings?.displayMode === 'compact' ? 'rounded-r-xl border-y border-r border-black/10 dark:border-white/10' : 'rounded-xl sm:rounded-2xl border border-black/10 dark:border-white/10 shadow-lg'} bg-black/50 dark:bg-black/70 backdrop-blur-md text-amber-400 hover:text-amber-300 hover:bg-amber-500/20`}
+                title={preferenceSettings.language === 'id' ? 'Tampilkan Semua Kontrol' : 'Show All Controls'}
+              >
+                <Eye size={20} className="sm:w-6 sm:h-6 animate-pulse group-hover:scale-110 transition-transform" />
+              </button>
+            </div>
+          )}
         </div>
       )}
 
