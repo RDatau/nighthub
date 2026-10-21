@@ -404,6 +404,7 @@ function getElectronGenAI(customKey) {
     return new GoogleGenAI({
       apiKey: customKey.trim(),
       httpOptions: {
+        fetch: require('cross-fetch'),
         headers: {
           'User-Agent': 'aistudio-build',
         },
@@ -419,6 +420,7 @@ function getElectronGenAI(customKey) {
     electronDefaultAiClient = new GoogleGenAI({
       apiKey,
       httpOptions: {
+        fetch: require('cross-fetch'),
         headers: {
           'User-Agent': 'aistudio-build',
         },
