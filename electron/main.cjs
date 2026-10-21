@@ -3,6 +3,24 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+// Prevent undici / fetch socket AssertionError from crashing the Electron app
+process.on('uncaughtException', (err) => {
+  if (err && (err.message && err.message.includes('ERR_ASSERTION') || err.stack && err.stack.includes('undici'))) {
+    console.warn('[SUPPRESSED UNDICI / ASSERTION ERROR]', err.message);
+    return;
+  }
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  if (err && (err.message && err.message.includes('ERR_ASSERTION') || err.stack && err.stack.includes('undici'))) {
+    console.warn('[SUPPRESSED UNHANDLED REJECTION]', err.message);
+    return;
+  }
+  console.error('Unhandled Rejection:', err);
+});
+
+
 // --- UTILITY PROCESS FOR BACKGROUND TASKS ---
 let backgroundWorker = null;
 
