@@ -4,7 +4,6 @@ import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality, LiveServerMessage } from "@google/genai";
-import crossFetch from "cross-fetch";
 
 // Safety settings untuk mengizinkan bahasa eksplisit/vulgar tanpa diblokir model
 export const safetySettings = [
@@ -28,11 +27,10 @@ function getGenAI(customKey?: string): GoogleGenAI {
     return new GoogleGenAI({
       apiKey: customKey.trim(),
       httpOptions: {
-        fetch: crossFetch,
         headers: {
           "User-Agent": "aistudio-build",
         },
-      } as any,
+      },
     });
   }
 
@@ -44,11 +42,10 @@ function getGenAI(customKey?: string): GoogleGenAI {
     defaultAiClient = new GoogleGenAI({
       apiKey,
       httpOptions: {
-        fetch: crossFetch,
         headers: {
           "User-Agent": "aistudio-build",
         },
-      } as any,
+      },
     });
   }
   return defaultAiClient;

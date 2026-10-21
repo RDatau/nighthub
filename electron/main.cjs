@@ -3,24 +3,6 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
-// Prevent undici / fetch socket AssertionError from crashing the Electron app
-process.on('uncaughtException', (err) => {
-  if (err && (err.message && err.message.includes('ERR_ASSERTION') || err.stack && err.stack.includes('undici'))) {
-    console.warn('[SUPPRESSED UNDICI / ASSERTION ERROR]', err.message);
-    return;
-  }
-  console.error('Uncaught Exception:', err);
-});
-
-process.on('unhandledRejection', (err) => {
-  if (err && (err.message && err.message.includes('ERR_ASSERTION') || err.stack && err.stack.includes('undici'))) {
-    console.warn('[SUPPRESSED UNHANDLED REJECTION]', err.message);
-    return;
-  }
-  console.error('Unhandled Rejection:', err);
-});
-
-
 // --- UTILITY PROCESS FOR BACKGROUND TASKS ---
 let backgroundWorker = null;
 
@@ -404,7 +386,6 @@ function getElectronGenAI(customKey) {
     return new GoogleGenAI({
       apiKey: customKey.trim(),
       httpOptions: {
-        fetch: require('cross-fetch'),
         headers: {
           'User-Agent': 'aistudio-build',
         },
@@ -420,7 +401,6 @@ function getElectronGenAI(customKey) {
     electronDefaultAiClient = new GoogleGenAI({
       apiKey,
       httpOptions: {
-        fetch: require('cross-fetch'),
         headers: {
           'User-Agent': 'aistudio-build',
         },
@@ -5356,11 +5336,8 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
       '-protocol_whitelist file,http,https,tcp,tls,crypto',
       '-rw_timeout 30000000',
       '-user_agent', userAgent,
-      '-probesize', '50M',
-      '-analyzeduration', '50M',
-      '-fflags', '+genpts+igndts',
-      '-use_wallclock_as_timestamps', '1',
-      '-r', '25',
+      '-probesize', '100000000',
+      '-analyzeduration', '100000000',
       '-ignore_unknown'
     ];
 
@@ -5500,7 +5477,7 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
           if (!bestVariantUrl) {
             for (let i = 0; i < lines.length; i++) {
               const line = lines[i].trim();
-              if (line && !line.startsWith('#')) {
+              if (line && !line.startsWith('#') && !line.includes('.image')) {
                 bestVariantUrl = line;
                 break;
               }
@@ -5722,7 +5699,6 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
           '-c:v', 'libx264',
           '-preset', 'ultrafast',
           '-pix_fmt', 'yuv420p',
-          '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
           '-c:a', 'aac',
           '-b:a', '128k',
           '-max_muxing_queue_size', '9999',

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Camera, Video, Link, Info, Settings, Subtitles, ListVideo, Database, Globe, MoreVertical, Clock, Rotate3D, Check, X, Keyboard, Sparkles, Eye, EyeOff } from 'lucide-react';
+import { Camera, Video, Link, Info, Settings, Subtitles, ListVideo, Database, Globe, MoreVertical, Clock, Rotate3D, Check, X, Keyboard, Sparkles } from 'lucide-react';
 
 import { AppearanceSettings } from '../services/db';
 import { t, Language } from '../services/i18n';
@@ -35,9 +35,7 @@ export const TopControls = ({
   completedDownloadsCount = 0,
   onToggleAILive,
   showAILive = false,
-  enableAIFeatures = true,
-  onToggleControlsHidden,
-  isControlsHidden = false
+  enableAIFeatures = true
 }: {
   onCaptureScreenshot: () => void;
   onToggleRecording: () => void;
@@ -70,8 +68,6 @@ export const TopControls = ({
   onToggleAILive?: () => void;
   showAILive?: boolean;
   enableAIFeatures?: boolean;
-  onToggleControlsHidden?: () => void;
-  isControlsHidden?: boolean;
 }) => {
   const [showTopMenu, setShowTopMenu] = useState(false);
   const topMenuRef = useRef<HTMLDivElement>(null);
@@ -173,17 +169,6 @@ export const TopControls = ({
             <Video size={20} className={`sm:w-6 sm:h-6 ${isRecording ? '' : 'group-hover:scale-110'} transition-transform`} />
           )}
         </button>
-
-        {onToggleControlsHidden && (
-          <button 
-            onClick={onToggleControlsHidden}
-            className={`w-10 h-10 sm:w-12 sm:h-12 hover:bg-orange-500/20 dark:hover:bg-amber-500/20 text-zinc-700 dark:text-zinc-300 hover:text-orange-600 dark:hover:text-amber-500 flex items-center justify-center transition-all duration-300 group ${isCompact ? 'rounded-r-xl border-y border-r border-black/10 dark:border-white/10' : 'rounded-xl sm:rounded-2xl border border-black/10 dark:border-white/10 shadow-lg'}`}
-            style={containerStyle}
-            title={lang === 'id' ? 'Sembunyikan Semua Kontrol' : 'Hide All Controls'}
-          >
-            <EyeOff size={20} className="sm:w-6 sm:h-6 group-hover:scale-110 transition-transform" />
-          </button>
-        )}
       </div>
 
       {/* Floating Action Buttons (Right Side) */}
