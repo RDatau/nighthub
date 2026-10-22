@@ -462,7 +462,9 @@ export function AILiveCompanionModal({
       isQuotaErrorRef.current = false;
 
       try {
-        const keyToUse = geminiApiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_api_key') : '') || '';
+        const rawKey = geminiApiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_api_key') : '') || '';
+        const cleanedKeys = rawKey.split(/[\r\n,;\s]+/).map(k => k.trim().replace(/^["']|["']$/g, '')).filter(k => k.length > 10);
+        const keyToUse = cleanedKeys[0] || rawKey.trim().replace(/[\r\n]+/g, '');
         const ai = new GoogleGenAI({ apiKey: keyToUse });
 
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });

@@ -90,8 +90,12 @@ export const AboutModal = ({
             setAnalyzedFilePath(filePath);
           }
           mediainfo.close();
-        } catch (e) {
-          console.error("Failed to get mediainfo", e);
+        } catch (e: any) {
+          console.error("Failed to get mediainfo, likely file access error:", e);
+          if (isMounted) {
+             setMediaInfo(null);
+             // Optionally set an error state here if needed
+          }
         } finally {
           if (isMounted) setIsLoadingInfo(false);
         }

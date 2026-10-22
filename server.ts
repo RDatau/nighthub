@@ -23,33 +23,32 @@ app.use(express.json({ limit: "25mb" }));
 let defaultAiClient: GoogleGenAI | null = null;
 
 function getGenAI(customKey?: string): GoogleGenAI {
+  let keyToUse = '';
   if (customKey && customKey.trim()) {
-    return new GoogleGenAI({
-      apiKey: customKey.trim(),
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
-    });
+    const cleaned = customKey
+      .split(/[\r\n,;\s]+/)
+      .map(k => k.trim().replace(/^["']|["']$/g, ''))
+      .filter(k => k.length > 10);
+    keyToUse = cleaned[0] || customKey.trim().replace(/[\r\n]+/g, '');
+  } else {
+    keyToUse = process.env.GEMINI_API_KEY || '';
   }
 
-  if (!defaultAiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error("GEMINI_API_KEY environment variable is missing and no custom key was provided.");
-    }
-    defaultAiClient = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
-    });
+  if (!keyToUse) {
+    throw new Error("GEMINI_API_KEY environment variable is missing and no custom key was provided.");
   }
-  return defaultAiClient;
+
+  return new GoogleGenAI({
+    apiKey: keyToUse,
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+    },
+  });
 }
+
+
 
 // API Endpoint to verify Gemini API Key
 app.post("/api/ai/verify-key", async (req, res) => {
@@ -57,7 +56,7 @@ app.post("/api/ai/verify-key", async (req, res) => {
     const { apiKey } = req.body;
     const ai = getGenAI(apiKey);
     const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
+      model: "gemini-3.1-flash-lite",
       contents: [{ parts: [{ text: "ping" }] }],
       config: {
         safetySettings: safetySettings as any,
@@ -74,6 +73,23 @@ app.post("/api/ai/verify-key", async (req, res) => {
   }
 });
 
+function buildTtsPart(text: string, modelName: string, styleInstruction?: string) {
+  const cleanText = text.replace(/[*#_~`]/g, "").slice(0, 500).trim();
+  const isModel38 = modelName && modelName.includes('3.8');
+  
+  if (isModel38 && styleInstruction && styleInstruction.trim()) {
+    return {
+      text: `Speak this text: "${cleanText}",`,
+      speechMetadata: {
+        style: styleInstruction.trim()
+      }
+    };
+  }
+  
+  const stylePrefix = styleInstruction && styleInstruction.trim() ? `[Style Instruction (Speech Tone & Emotion)]: ${styleInstruction.trim()}\n` : '';
+  return { text: `${stylePrefix}Speak this text: "${cleanText}".` };
+}
+
 // API Endpoint for generating standalone TTS audio for specific text
 app.post("/api/ai/tts", async (req, res) => {
   try {
@@ -86,16 +102,14 @@ app.post("/api/ai/tts", async (req, res) => {
     let audioBase64: string | null = null;
     let mimeType: string = "audio/pcm";
 
-    const cleanText = text.replace(/[*#_~`]/g, "").slice(0, 500).trim();
     const voiceName = voice || "Kore";
     const primaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : "gemini-3.1-flash-tts-preview";
-    const stylePrefix = aiStyleInstruction && aiStyleInstruction.trim() ? `[Style Instruction (Speech Tone & Emotion)]: ${aiStyleInstruction.trim()}\n` : '';
-    const fullSpeechPrompt = `${stylePrefix}Speak this text: "${cleanText}".`;
+    const ttsPart = buildTtsPart(text, primaryModel, aiStyleInstruction);
 
     try {
       const speechResponse = await ai.models.generateContent({
         model: primaryModel,
-        contents: [{ parts: [{ text: fullSpeechPrompt }] }],
+        contents: [{ parts: [ttsPart] }],
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
@@ -114,8 +128,8 @@ app.post("/api/ai/tts", async (req, res) => {
       console.warn("Primary TTS endpoint warning, trying gemini-2.5-flash fallback:", primaryErr);
       try {
         const fallbackResponse = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: [{ parts: [{ text: fullSpeechPrompt }] }],
+          model: "gemini-1.5-flash",
+          contents: [{ parts: [buildTtsPart(text, "gemini-1.5-flash", aiStyleInstruction)] }],
           config: {
             responseModalities: [Modality.AUDIO],
             speechConfig: {
@@ -163,7 +177,7 @@ app.post("/api/ai/live-comment", async (req, res) => {
       apiKey,
       lang = "id",
       aiResponseLanguage,
-      chatModel = "gemini-3.6-flash",
+      chatModel = "gemini-3.1-flash-lite",
       liveModel = "gemini-3.1-flash-live-preview",
       ttsModel,
       aiTtsModel,
@@ -247,7 +261,7 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
 
     contentsParts.push({ text: fullUserPrompt });
 
-    const targetModel = chatModel || "gemini-3.6-flash";
+    const targetModel = chatModel || "gemini-3.1-flash-lite";
 
     const computedSafetySettings = [
       { category: 'HARM_CATEGORY_HARASSMENT', threshold: userSafetySetting === 'block_few' ? 'BLOCK_ONLY_HIGH' : 'BLOCK_NONE' },
@@ -301,13 +315,12 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
       const cleanReply = replyText.replace(/[*#_~`]/g, "").slice(0, 400).trim();
       const voiceName = voice || "Kore";
       const ttsPrimaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : (aiTtsModel || "gemini-3.1-flash-tts-preview");
-      const stylePrefix = aiStyleInstruction && aiStyleInstruction.trim() ? `[Style Instruction (Speech Tone & Emotion)]: ${aiStyleInstruction.trim()}\n` : '';
-      const speechPrompt = `${stylePrefix}Speak this text: "${cleanReply}".`;
+      const ttsPart = buildTtsPart(cleanReply, ttsPrimaryModel, aiStyleInstruction);
 
       try {
         const speechResponse = await ai.models.generateContent({
           model: ttsPrimaryModel,
-          contents: [{ parts: [{ text: speechPrompt }] }],
+          contents: [{ parts: [ttsPart] }],
           config: {
             responseModalities: [Modality.AUDIO],
             speechConfig: {
@@ -326,8 +339,8 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
         console.warn("Primary TTS Generation warning, trying gemini-3.1-flash fallback:", ttsErr);
         try {
           const fallbackResponse = await ai.models.generateContent({
-            model: "gemini-3.1-flash",
-            contents: [{ parts: [{ text: speechPrompt }] }],
+            model: "gemini-1.5-flash",
+            contents: [{ parts: [buildTtsPart(cleanReply, "gemini-1.5-flash", aiStyleInstruction)] }],
             config: {
               responseModalities: [Modality.AUDIO],
               speechConfig: {

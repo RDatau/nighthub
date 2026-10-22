@@ -1807,8 +1807,8 @@ export const SettingsModal = ({
 
                 <div className="p-3.5 rounded-2xl bg-white/80 dark:bg-zinc-950/80 border border-zinc-200 dark:border-zinc-800/80 shadow-inner flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
                   <div className="relative flex-1 flex items-center">
-                    <input
-                      type={showApiKey ? 'text' : 'password'}
+                    <textarea
+                      rows={3}
                       value={preferenceSettings.geminiApiKey || ''}
                       onChange={(e) =>
                         onPreferenceSettingsChange({
@@ -1816,8 +1816,8 @@ export const SettingsModal = ({
                           geminiApiKey: e.target.value,
                         })
                       }
-                      placeholder={lang === 'en' ? 'Enter custom Gemini API Key (AIZA...)' : 'Masukkan Gemini API Key secara manual (AIZA...)'}
-                      className="w-full bg-zinc-100/90 dark:bg-zinc-900/90 border border-zinc-200 dark:border-zinc-800 rounded-xl pl-3 pr-10 py-2.5 text-xs font-mono text-zinc-900 dark:text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-cyan-500/60 focus:ring-1 focus:ring-cyan-500/30"
+                      placeholder={lang === 'en' ? 'Enter multiple Gemini API Keys (one per line)...' : 'Masukkan beberapa Gemini API Key (satu per baris)...'}
+                      className="w-full bg-zinc-100/90 dark:bg-zinc-900/90 border border-zinc-200 dark:border-zinc-800 rounded-xl px-3 py-2.5 text-xs font-mono text-zinc-900 dark:text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-cyan-500/60 focus:ring-1 focus:ring-cyan-500/30 resize-y"
                     />
                     <button
                       type="button"
@@ -2003,6 +2003,9 @@ export const SettingsModal = ({
                   ))}
                 </div>
 
+                <label className="text-zinc-700 dark:text-zinc-300 text-[10px] uppercase font-bold tracking-[0.2em] block mt-4">
+                  {lang === 'en' ? 'STYLE INSTRUCTION' : 'STYLE INSTRUCTION (GAYA BICARA/TONE)'}
+                </label>
                 <textarea
                   rows={2}
                   value={preferenceSettings.aiStyleInstruction || ''}
@@ -2012,6 +2015,7 @@ export const SettingsModal = ({
                       aiStyleInstruction: e.target.value,
                     })
                   }
+
                   placeholder={
                     lang === 'en'
                       ? 'e.g. Speak with an enthusiastic tone, fast pace, expressive emotion, clear articulation, and energetic mood...'
@@ -2171,6 +2175,8 @@ export const SettingsModal = ({
                   <span>
                     {(() => {
                       const val = preferenceSettings.aiChatModel || 'gemini-3.6-flash';
+                      if (val === 'gemini-3.8-flash') return `gemini-3.8-flash (${lang === 'en' ? 'Gemini 3.8 Advanced Flash' : 'Gemini 3.8 Flash Terbaru'})`;
+                      if (val === 'gemini-3.8-pro') return `gemini-3.8-pro (${lang === 'en' ? 'Gemini 3.8 Pro Reasoning' : 'Gemini 3.8 Pro Penalaran'})`;
                       if (val === 'gemini-3.6-flash') return `gemini-3.6-flash (${lang === 'en' ? 'Recommended - Fast & Smart' : 'Rekomendasi - Cepat & Cerdas'})`;
                       if (val === 'gemini-2.5-flash') return `gemini-2.5-flash (${lang === 'en' ? 'Ultra Fast' : 'Super Cepat'})`;
                       if (val === 'gemini-2.5-pro') return `gemini-2.5-pro (${lang === 'en' ? 'Deep Reasoning & Context' : 'Analisis Mendalam'})`;
@@ -2186,9 +2192,13 @@ export const SettingsModal = ({
                 {isChatModelDropdownOpen && (
                   <div className="absolute left-0 right-0 mt-2 bg-white dark:bg-[#120a06] border border-black/10 dark:border-white/10 rounded-xl shadow-2xl max-h-60 overflow-y-auto z-40 py-1.5 scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 animate-in fade-in slide-in-from-top-2 duration-150">
                     {[
-                      { value: 'gemini-3.6-flash', label: `gemini-3.6-flash (${lang === 'en' ? 'Recommended - Fast & Smart' : 'Rekomendasi - Cepat & Cerdas'})` },
-                      { value: 'gemini-2.5-flash', label: `gemini-2.5-flash (${lang === 'en' ? 'Ultra Fast' : 'Super Cepat'})` },
-                      { value: 'gemini-2.5-pro', label: `gemini-2.5-pro (${lang === 'en' ? 'Deep Reasoning & Context' : 'Analisis Mendalam'})` },
+                      { value: 'gemini-3.1-flash-lite', label: 'gemini-3.1-flash-lite (Default)' },
+                      { value: 'gemini-3.5-flash-lite', label: 'gemini-3.5-flash-lite' },
+                      { value: 'gemini-2.5-flash', label: 'gemini-2.5-flash' },
+                      { value: 'gemini-2.5-pro', label: 'gemini-2.5-pro' },
+                      { value: 'gemini-3.8-flash', label: 'gemini-3.8-flash' },
+                      { value: 'gemini-3.1-pro-preview', label: 'gemini-3.1-pro-preview' },
+                      { value: 'gemini-1.5-flash', label: 'gemini-1.5-flash' },
                     ].map((opt) => {
                       const isSelected = (preferenceSettings.aiChatModel || 'gemini-3.6-flash') === opt.value;
                       return (
@@ -2229,9 +2239,9 @@ export const SettingsModal = ({
                   <span>
                     {(() => {
                       const val = preferenceSettings.aiLiveModel || 'gemini-3.1-flash-live-preview';
+                      if (val === 'gemini-3.8-flash-live-preview') return `gemini-3.8-flash-live-preview (${lang === 'en' ? 'Gemini 3.8 Advanced Live Agent' : 'Model Live 3.8 Terbaru'})`;
                       if (val === 'gemini-3.1-flash-live-preview') return `gemini-3.1-flash-live-preview (${lang === 'en' ? 'Default Live Model' : 'Model Live Standar'})`;
                       if (val === 'gemini-2.5-flash-native-audio-preview-12-2025') return `gemini-2.5-flash-native-audio-preview-12-2025 (${lang === 'en' ? 'Native Audio Preview' : 'Model Native Audio'})`;
-                      if (val === 'gemini-2.5-flash-native-audio-preview-09-2025') return `gemini-2.5-flash-native-audio-preview-09-2025 (${lang === 'en' ? 'Native Audio Preview' : 'Model Native Audio'})`;
                       return val;
                     })()}
                   </span>
@@ -2244,9 +2254,9 @@ export const SettingsModal = ({
                 {isLiveModelDropdownOpen && (
                   <div className="absolute left-0 right-0 mt-2 bg-white dark:bg-[#120a06] border border-black/10 dark:border-white/10 rounded-xl shadow-2xl max-h-60 overflow-y-auto z-40 py-1.5 scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 animate-in fade-in slide-in-from-top-2 duration-150">
                     {[
+                      { value: 'gemini-3.8-flash-live-preview', label: `gemini-3.8-flash-live-preview (${lang === 'en' ? 'Gemini 3.8 Advanced Live Agent' : 'Model Live 3.8 Terbaru'})` },
                       { value: 'gemini-3.1-flash-live-preview', label: `gemini-3.1-flash-live-preview (${lang === 'en' ? 'Default Live Model' : 'Model Live Standar'})` },
                       { value: 'gemini-2.5-flash-native-audio-preview-12-2025', label: `gemini-2.5-flash-native-audio-preview-12-2025 (${lang === 'en' ? 'Native Audio Preview' : 'Model Native Audio'})` },
-                      { value: 'gemini-2.5-flash-native-audio-preview-09-2025', label: `gemini-2.5-flash-native-audio-preview-09-2025 (${lang === 'en' ? 'Native Audio Preview' : 'Model Native Audio'})` },
                     ].map((opt) => {
                       const isSelected = (preferenceSettings.aiLiveModel || 'gemini-3.1-flash-live-preview') === opt.value;
                       return (
@@ -2287,9 +2297,10 @@ export const SettingsModal = ({
                   <span>
                     {(() => {
                       const val = preferenceSettings.aiTtsModel || 'gemini-2.5-flash-preview-tts';
-                      if (val === 'gemini-2.5-flash-preview-tts') return `gemini-2.5-flash-preview-tts (${lang === 'en' ? 'Fast Voice Model' : 'Suara Cepat'})`;
-                      if (val === 'gemini-2.5-pro-preview-tts') return `gemini-2.5-pro-preview-tts (${lang === 'en' ? 'Default - High Quality Voice' : 'Default - Kualitas Suara Tinggi'})`;
+                      if (val === 'gemini-3.8-flash-tts') return `gemini-3.8-flash-tts (${lang === 'en' ? 'Gemini 3.8 HD Voice Model' : 'Gemini 3.8 Suara HD Terbaru'})`;
+                      if (val === 'gemini-3.8-flash-lite-tts') return `gemini-3.8-flash-lite-tts (${lang === 'en' ? 'Gemini 3.8 Fast Voice Model' : 'Gemini 3.8 Suara Cepat'})`;
                       if (val === 'gemini-3.1-flash-tts-preview') return `gemini-3.1-flash-tts-preview (${lang === 'en' ? 'TTS Voice Preview Model' : 'Model Suara TTS HD'})`;
+                      if (val === 'gemini-2.5-pro-preview-tts') return `gemini-2.5-pro-preview-tts (${lang === 'en' ? 'Default - High Quality Voice' : 'Default - Kualitas Suara Tinggi'})`;
                       return val;
                     })()}
                   </span>
@@ -2302,9 +2313,10 @@ export const SettingsModal = ({
                 {isTtsModelDropdownOpen && (
                   <div className="absolute left-0 right-0 mt-2 bg-white dark:bg-[#120a06] border border-black/10 dark:border-white/10 rounded-xl shadow-2xl max-h-60 overflow-y-auto z-40 py-1.5 scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 animate-in fade-in slide-in-from-top-2 duration-150">
                     {[
-                      { value: 'gemini-2.5-flash-preview-tts', label: `gemini-2.5-flash-preview-tts (${lang === 'en' ? 'Fast Voice Model' : 'Suara Cepat'})` },
-                      { value: 'gemini-2.5-pro-preview-tts', label: `gemini-2.5-pro-preview-tts (${lang === 'en' ? 'Default - High Quality Voice' : 'Default - Kualitas Suara Tinggi'})` },
+                      { value: 'gemini-3.8-flash-tts', label: `gemini-3.8-flash-tts (${lang === 'en' ? 'Gemini 3.8 HD Voice Model' : 'Gemini 3.8 Suara HD Terbaru'})` },
+                      { value: 'gemini-3.8-flash-lite-tts', label: `gemini-3.8-flash-lite-tts (${lang === 'en' ? 'Gemini 3.8 Fast Voice Model' : 'Gemini 3.8 Suara Cepat'})` },
                       { value: 'gemini-3.1-flash-tts-preview', label: `gemini-3.1-flash-tts-preview (${lang === 'en' ? 'TTS Voice Preview Model' : 'Model Suara TTS HD'})` },
+                      { value: 'gemini-2.5-pro-preview-tts', label: `gemini-2.5-pro-preview-tts (${lang === 'en' ? 'Default - High Quality Voice' : 'Default - Kualitas Suara Tinggi'})` },
                     ].map((opt) => {
                       const isSelected = (preferenceSettings.aiTtsModel || 'gemini-2.5-flash-preview-tts') === opt.value;
                       return (
@@ -2332,11 +2344,18 @@ export const SettingsModal = ({
 
               <div className="h-px bg-black/5 dark:bg-white/5"></div>
 
-              {/* PILIH SUARA AI (VOICE) */}
+              {/* PILIH SUARA AI (VOICE) - DYNAMIC 3.8 VS STANDARD */}
               <div className="space-y-3 relative dropdown-container">
-                <label className="text-zinc-700 dark:text-zinc-300 text-[10px] uppercase font-bold tracking-[0.2em] block">
-                  {lang === 'en' ? 'AI VOICE CHARACTER (TTS / LIVE)' : 'PILIH SUARA AI (TTS / LIVE)'}
-                </label>
+                <div className="flex items-center justify-between">
+                  <label className="text-zinc-700 dark:text-zinc-300 text-[10px] uppercase font-bold tracking-[0.2em] block">
+                    {lang === 'en' ? 'AI VOICE CHARACTER (TTS / LIVE)' : 'PILIH SUARA AI (TTS / LIVE)'}
+                  </label>
+                  {((preferenceSettings.aiTtsModel || '').includes('3.8') || (preferenceSettings.aiLiveModel || '').includes('3.8')) && (
+                    <span className="text-[9px] bg-amber-500/20 text-amber-600 dark:text-amber-400 font-bold px-2 py-0.5 rounded-full border border-amber-500/30">
+                      Gemini 3.8 Extended Voices Active ✨
+                    </span>
+                  )}
+                </div>
                 <button
                   type="button"
                   onClick={() => setIsVoiceDropdownOpen(!isVoiceDropdownOpen)}
@@ -2347,13 +2366,30 @@ export const SettingsModal = ({
                     <span>
                       {(() => {
                         const val = preferenceSettings.aiVoice || 'Kore';
-                        if (val === 'Kore') return `Kore (${lang === 'en' ? 'Female - Natural & Warm' : 'Perempuan - Natural & Hangat'})`;
-                        if (val === 'Zephyr') return `Zephyr (${lang === 'en' ? 'Female - Fast & Energetic' : 'Perempuan - Cepat & Energik'})`;
-                        if (val === 'Puck') return `Puck (${lang === 'en' ? 'Male - Cheerful & Friendly' : 'Laki-laki - Ceria & Ramah'})`;
-                        if (val === 'Charon') return `Charon (${lang === 'en' ? 'Male - Deep & Serious' : 'Laki-laki - Dalam & Serius'})`;
-                        if (val === 'Fenrir') return `Fenrir (${lang === 'en' ? 'Male - Authoritative' : 'Laki-laki - Berwibawa & Tegas'})`;
-                        if (val === 'Aoede') return `Aoede (${lang === 'en' ? 'Female - Soft & Melodic' : 'Perempuan - Halus & Merdu'})`;
-                        return val;
+                        const is38 = (preferenceSettings.aiTtsModel || '').includes('3.8') || (preferenceSettings.aiLiveModel || '').includes('3.8');
+                        const voicesList = is38 ? [
+                          { value: 'Fola', label: 'Fola (Jernih & Ramah - Medium Pitch)' },
+                          { value: 'Tavi', label: 'Tavi (Ekspresif & Natural - Extended Voice)' },
+                          { value: 'Gacrux', label: 'Gacrux (Dewasa, Matang & Berbobot)' },
+                          { value: 'Vindemiatrix', label: 'Vindemiatrix (Lembut & Menenangkan)' },
+                          { value: 'Aoede', label: 'Aoede (Hangat & Natural)' },
+                          { value: 'Kore', label: 'Kore (Ceria & Tegas)' },
+                          { value: 'Puck', label: 'Puck (Deep & Santai)' },
+                          { value: 'Charon', label: 'Charon (Elegan & Kalem)' },
+                          { value: 'Zephyr', label: 'Zephyr (Ramah & Jernih)' },
+                          { value: 'Fenrir', label: 'Fenrir (Enerjik & Bersemangat)' },
+                          { value: 'Leda', label: 'Leda (Muda & Lembut)' },
+                          { value: 'Orus', label: 'Orus (Tegas & Wibawa)' }
+                        ] : [
+                          { value: 'Kore', label: `Kore (${lang === 'en' ? 'Female - Natural & Warm' : 'Perempuan - Natural & Hangat'})` },
+                          { value: 'Zephyr', label: `Zephyr (${lang === 'en' ? 'Female - Fast & Energetic' : 'Perempuan - Cepat & Energik'})` },
+                          { value: 'Puck', label: `Puck (${lang === 'en' ? 'Male - Cheerful & Friendly' : 'Laki-laki - Ceria & Ramah'})` },
+                          { value: 'Charon', label: `Charon (${lang === 'en' ? 'Male - Deep & Serious' : 'Laki-laki - Dalam & Serius'})` },
+                          { value: 'Fenrir', label: `Fenrir (${lang === 'en' ? 'Male - Authoritative' : 'Laki-laki - Berwibawa & Tegas'})` },
+                          { value: 'Aoede', label: `Aoede (${lang === 'en' ? 'Female - Soft & Melodic' : 'Perempuan - Halus & Merdu'})` },
+                        ];
+                        const found = voicesList.find(v => v.value === val);
+                        return found ? found.label : val;
                       })()}
                     </span>
                   </div>
@@ -2365,34 +2401,52 @@ export const SettingsModal = ({
 
                 {isVoiceDropdownOpen && (
                   <div className="absolute left-0 right-0 mt-2 bg-white dark:bg-[#120a06] border border-black/10 dark:border-white/10 rounded-xl shadow-2xl max-h-60 overflow-y-auto z-40 py-1.5 scrollbar-thin scrollbar-thumb-zinc-300 dark:scrollbar-thumb-zinc-700 animate-in fade-in slide-in-from-top-2 duration-150">
-                    {[
-                      { value: 'Kore', label: `Kore (${lang === 'en' ? 'Female - Natural & Warm' : 'Perempuan - Natural & Hangat'})` },
-                      { value: 'Zephyr', label: `Zephyr (${lang === 'en' ? 'Female - Fast & Energetic' : 'Perempuan - Cepat & Energik'})` },
-                      { value: 'Puck', label: `Puck (${lang === 'en' ? 'Male - Cheerful & Friendly' : 'Laki-laki - Ceria & Ramah'})` },
-                      { value: 'Charon', label: `Charon (${lang === 'en' ? 'Male - Deep & Serious' : 'Laki-laki - Dalam & Serius'})` },
-                      { value: 'Fenrir', label: `Fenrir (${lang === 'en' ? 'Male - Authoritative' : 'Laki-laki - Berwibawa & Tegas'})` },
-                      { value: 'Aoede', label: `Aoede (${lang === 'en' ? 'Female - Soft & Melodic' : 'Perempuan - Halus & Merdu'})` },
-                    ].map((opt) => {
-                      const isSelected = (preferenceSettings.aiVoice || 'Kore') === opt.value;
-                      return (
-                        <button
-                          key={opt.value}
-                          type="button"
-                          onClick={() => {
-                            onPreferenceSettingsChange({ ...preferenceSettings, aiVoice: opt.value });
-                            setIsVoiceDropdownOpen(false);
-                          }}
-                          className={`w-full text-left px-4 py-2.5 text-xs font-mono transition-colors flex items-center justify-between ${
-                            isSelected
-                              ? 'bg-orange-500/10 dark:bg-amber-500/10 text-orange-600 dark:text-amber-500 font-bold'
-                              : 'text-zinc-700 dark:text-zinc-300 hover:bg-black/5 dark:hover:bg-white/5'
-                          }`}
-                        >
-                          <span>{opt.label}</span>
-                          {isSelected && <div className="w-1.5 h-1.5 rounded-full bg-orange-500 dark:bg-amber-500 shrink-0" />}
-                        </button>
-                      );
-                    })}
+                    {(() => {
+                      const is38 = (preferenceSettings.aiTtsModel || '').includes('3.8') || (preferenceSettings.aiLiveModel || '').includes('3.8');
+                      const voicesList = is38 ? [
+                        { value: 'Fola', label: 'Fola (Jernih & Ramah - Medium Pitch)' },
+                        { value: 'Tavi', label: 'Tavi (Ekspresif & Natural - Extended Voice)' },
+                        { value: 'Gacrux', label: 'Gacrux (Dewasa, Matang & Berbobot)' },
+                        { value: 'Vindemiatrix', label: 'Vindemiatrix (Lembut & Menenangkan)' },
+                        { value: 'Aoede', label: 'Aoede (Hangat & Natural)' },
+                        { value: 'Kore', label: 'Kore (Ceria & Tegas)' },
+                        { value: 'Puck', label: 'Puck (Deep & Santai)' },
+                        { value: 'Charon', label: 'Charon (Elegan & Kalem)' },
+                        { value: 'Zephyr', label: 'Zephyr (Ramah & Jernih)' },
+                        { value: 'Fenrir', label: 'Fenrir (Enerjik & Bersemangat)' },
+                        { value: 'Leda', label: 'Leda (Muda & Lembut)' },
+                        { value: 'Orus', label: 'Orus (Tegas & Wibawa)' }
+                      ] : [
+                        { value: 'Kore', label: `Kore (${lang === 'en' ? 'Female - Natural & Warm' : 'Perempuan - Natural & Hangat'})` },
+                        { value: 'Zephyr', label: `Zephyr (${lang === 'en' ? 'Female - Fast & Energetic' : 'Perempuan - Cepat & Energik'})` },
+                        { value: 'Puck', label: `Puck (${lang === 'en' ? 'Male - Cheerful & Friendly' : 'Laki-laki - Ceria & Ramah'})` },
+                        { value: 'Charon', label: `Charon (${lang === 'en' ? 'Male - Deep & Serious' : 'Laki-laki - Dalam & Serius'})` },
+                        { value: 'Fenrir', label: `Fenrir (${lang === 'en' ? 'Male - Authoritative' : 'Laki-laki - Berwibawa & Tegas'})` },
+                        { value: 'Aoede', label: `Aoede (${lang === 'en' ? 'Female - Soft & Merdu' : 'Perempuan - Halus & Merdu'})` },
+                      ];
+
+                      return voicesList.map((opt) => {
+                        const isSelected = (preferenceSettings.aiVoice || 'Kore') === opt.value;
+                        return (
+                          <button
+                            key={opt.value}
+                            type="button"
+                            onClick={() => {
+                              onPreferenceSettingsChange({ ...preferenceSettings, aiVoice: opt.value });
+                              setIsVoiceDropdownOpen(false);
+                            }}
+                            className={`w-full text-left px-4 py-2.5 text-xs font-mono transition-colors flex items-center justify-between ${
+                              isSelected
+                                ? 'bg-orange-500/10 dark:bg-amber-500/10 text-orange-600 dark:text-amber-500 font-bold'
+                                : 'text-zinc-700 dark:text-zinc-300 hover:bg-black/5 dark:hover:bg-white/5'
+                            }`}
+                          >
+                            <span>{opt.label}</span>
+                            {isSelected && <div className="w-1.5 h-1.5 rounded-full bg-orange-500 dark:bg-amber-500 shrink-0" />}
+                          </button>
+                        );
+                      });
+                    })()}
                   </div>
                 )}
               </div>

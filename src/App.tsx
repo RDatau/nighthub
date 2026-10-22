@@ -1488,63 +1488,67 @@ export default function App() {
               reader.readAsArrayBuffer(file.slice(offset, offset + chunkSize));
             });
 
-          const result = await mediainfo.analyzeData(getSize, readChunk);
-          const menuTrack = result?.media?.track?.find((t: any) => t['@type'] === 'Menu');
-          
-          if (menuTrack && menuTrack.extra) {
-            const extractedMarkers: VideoMarker[] = [];
-            Object.entries(menuTrack.extra).forEach(([key, value]) => {
-              const normalizedKey = key.replace(/^_+/, '').replace(/_/g, ':');
-              const timestampRegex = /^(\d{2}:)?\d{2}:\d{2}([.:]\d{3})?$/;
-              let timeStr = '';
-              let labelStr = value as string;
+          try {
+            const result = await mediainfo.analyzeData(getSize, readChunk);
+            const menuTrack = result?.media?.track?.find((t: any) => t['@type'] === 'Menu');
+            
+            if (menuTrack && menuTrack.extra) {
+              const extractedMarkers: VideoMarker[] = [];
+              Object.entries(menuTrack.extra).forEach(([key, value]) => {
+                const normalizedKey = key.replace(/^_+/, '').replace(/_/g, ':');
+                const timestampRegex = /^(\d{2}:)?\d{2}:\d{2}([.:]\d{3})?$/;
+                let timeStr = '';
+                let labelStr = value as string;
 
-              if (timestampRegex.test(normalizedKey)) {
-                timeStr = normalizedKey;
-              } else if (typeof value === 'string' && timestampRegex.test(value)) {
-                timeStr = value;
-                labelStr = key;
-              }
+                if (timestampRegex.test(normalizedKey)) {
+                  timeStr = normalizedKey;
+                } else if (typeof value === 'string' && timestampRegex.test(value)) {
+                  timeStr = value;
+                  labelStr = key;
+                }
 
-              if (timeStr) {
-                const parts = timeStr.split(/[:.]/);
-                let hours = 0, minutes = 0, seconds = 0, ms = 0;
-                
-                if (parts.length === 4) {
-                  hours = parseInt(parts[0], 10);
-                  minutes = parseInt(parts[1], 10);
-                  seconds = parseInt(parts[2], 10);
-                  ms = parseInt(parts[3], 10);
-                } else if (parts.length === 3) {
-                  if (timeStr.includes('.') || timeStr.includes(',')) {
-                    minutes = parseInt(parts[0], 10);
-                    seconds = parseInt(parts[1], 10);
-                    ms = parseInt(parts[2], 10);
-                  } else {
+                if (timeStr) {
+                  const parts = timeStr.split(/[:.]/);
+                  let hours = 0, minutes = 0, seconds = 0, ms = 0;
+                  
+                  if (parts.length === 4) {
                     hours = parseInt(parts[0], 10);
                     minutes = parseInt(parts[1], 10);
                     seconds = parseInt(parts[2], 10);
+                    ms = parseInt(parts[3], 10);
+                  } else if (parts.length === 3) {
+                    if (timeStr.includes('.') || timeStr.includes(',')) {
+                      minutes = parseInt(parts[0], 10);
+                      seconds = parseInt(parts[1], 10);
+                      ms = parseInt(parts[2], 10);
+                    } else {
+                      hours = parseInt(parts[0], 10);
+                      minutes = parseInt(parts[1], 10);
+                      seconds = parseInt(parts[2], 10);
+                    }
+                  } else if (parts.length === 2) {
+                    minutes = parseInt(parts[0], 10);
+                    seconds = parseInt(parts[1], 10);
                   }
-                } else if (parts.length === 2) {
-                  minutes = parseInt(parts[0], 10);
-                  seconds = parseInt(parts[1], 10);
+                  
+                  const timeInSeconds = (hours * 3600) + (minutes * 60) + seconds + (ms / 1000);
+                  if (!loadedMarkers.some(m => Math.abs(m.time - timeInSeconds) < 0.5)) {
+                    extractedMarkers.push({
+                      id: `mkv_${timeInSeconds}`,
+                      time: timeInSeconds,
+                      label: labelStr.split(' - ')[0] || `Chapter ${extractedMarkers.length + 1}`
+                    });
+                  }
                 }
-                
-                const timeInSeconds = (hours * 3600) + (minutes * 60) + seconds + (ms / 1000);
-                if (!loadedMarkers.some(m => Math.abs(m.time - timeInSeconds) < 0.5)) {
-                  extractedMarkers.push({
-                    id: `mkv_${timeInSeconds}`,
-                    time: timeInSeconds,
-                    label: labelStr.split(' - ')[0] || `Chapter ${extractedMarkers.length + 1}`
-                  });
-                }
+              });
+              
+              if (extractedMarkers.length > 0) {
+                loadedMarkers = [...loadedMarkers, ...extractedMarkers].sort((a, b) => a.time - b.time);
+                await dbService.saveMarkers(id, loadedMarkers);
               }
-            });
-            
-            if (extractedMarkers.length > 0) {
-              loadedMarkers = [...loadedMarkers, ...extractedMarkers].sort((a, b) => a.time - b.time);
-              await dbService.saveMarkers(id, loadedMarkers);
             }
+          } catch (analysisErr) {
+            console.error("MediaInfo analysis failed, skipping chapters:", analysisErr);
           }
         } catch (err) {
           console.error("Failed to parse MKV chapters:", err);
