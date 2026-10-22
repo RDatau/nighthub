@@ -252,18 +252,27 @@ export const isTtsModelStreamSupported = (modelName: string): boolean => {
   return m.includes('3.8') || m.includes('3.1') || m.includes('live');
 };
 
-export function buildTtsPart(text: string, modelName: string, styleInstruction?: string) {
-  const cleanText = text.replace(/[*#_~`]/g, "").slice(0, 500).trim();
-  const isModel38 = modelName && modelName.includes('3.8');
+export function buildTtsParts(text: string, modelName: string, styleInstruction?: string): any[] {
+  const cleanText = text.replace(/[*#_~`]/g, "").slice(0, 800).trim();
+  const isModel38 = (modelName || '').toLowerCase().includes('3.8');
   
   if (isModel38 && styleInstruction && styleInstruction.trim()) {
-    return {
-      text: `Speak this text: "${cleanText}",\nspeechMetadata: {\n  style: ${styleInstruction.trim()}\n}`
-    };
+    const rawStyle = styleInstruction.trim();
+    return [
+      {
+        text: `Speak this text: "${cleanText}",\nspeechMetadata: {\n  style: ${JSON.stringify(rawStyle)}\n}`
+      },
+      {
+        inlineData: {
+          mimeType: 'application/json',
+          data: Buffer.from(JSON.stringify({ style: rawStyle })).toString('base64')
+        }
+      }
+    ];
   }
   
   const stylePrefix = styleInstruction && styleInstruction.trim() ? `[Style Instruction (Speech Tone & Emotion)]: ${styleInstruction.trim()}\n` : '';
-  return { text: `${stylePrefix}Speak this text: "${cleanText}".` };
+  return [{ text: `${stylePrefix}Speak this text: "${cleanText}".` }];
 }
 
 // API Endpoint for generating standalone TTS audio for specific text
@@ -276,7 +285,7 @@ app.post("/api/ai/tts", async (req, res) => {
 
     const voiceName = voice || "Kore";
     const primaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : "gemini-3.8-flash-tts";
-    const ttsPart = buildTtsPart(text, primaryModel, aiStyleInstruction);
+    const ttsParts = buildTtsParts(text, primaryModel, aiStyleInstruction);
     const supportsStreaming = isTtsModelStreamSupported(primaryModel);
 
     const result = await executeWithKeyRotation(
@@ -290,7 +299,7 @@ app.post("/api/ai/tts", async (req, res) => {
           try {
             const stream = await ai.models.generateContentStream({
               model: primaryModel,
-              contents: [{ parts: [ttsPart] }],
+              contents: [{ parts: ttsParts }],
               config: {
                 responseModalities: [Modality.AUDIO],
                 speechConfig: {
@@ -335,7 +344,7 @@ app.post("/api/ai/tts", async (req, res) => {
         if (!audioBase64) {
           const speechResponse = await ai.models.generateContent({
             model: primaryModel,
-            contents: [{ parts: [ttsPart] }],
+            contents: [{ parts: ttsParts }],
             config: {
               responseModalities: [Modality.AUDIO],
               speechConfig: {
@@ -542,7 +551,7 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
         const ttsPrimaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : (aiTtsModel || "gemini-3.8-flash-tts");
         const voiceName = voice || "Kore";
         const cleanReply = replyText.replace(/[*#_~`]/g, "").slice(0, 400).trim();
-        const ttsPart = buildTtsPart(cleanReply, ttsPrimaryModel, aiStyleInstruction);
+        const ttsParts = buildTtsParts(cleanReply, ttsPrimaryModel, aiStyleInstruction);
         const supportsStreaming = isTtsModelStreamSupported(ttsPrimaryModel);
 
         const ttsResult = await executeWithKeyRotation(
@@ -555,7 +564,7 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
               try {
                 const stream = await ai.models.generateContentStream({
                   model: ttsPrimaryModel,
-                  contents: [{ parts: [ttsPart] }],
+                  contents: [{ parts: ttsParts }],
                   config: {
                     responseModalities: [Modality.AUDIO],
                     speechConfig: {
@@ -593,7 +602,7 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
             if (!chunkAudio) {
               const speechResponse = await ai.models.generateContent({
                 model: ttsPrimaryModel,
-                contents: [{ parts: [ttsPart] }],
+                contents: [{ parts: ttsParts }],
                 config: {
                   responseModalities: [Modality.AUDIO],
                   speechConfig: {

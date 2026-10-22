@@ -5509,6 +5509,7 @@ export default function App() {
           aiTtsModel={preferenceSettings.aiTtsModel}
           aiCustomPersona={preferenceSettings.aiCustomPersona}
           aiLanguageStyle={preferenceSettings.aiLanguageStyle}
+          aiStyleInstruction={preferenceSettings.aiStyleInstruction}
           aiPredictiveCaching={preferenceSettings.aiPredictiveCaching !== false}
           aiPredictiveMs={preferenceSettings.aiPredictiveMs}
           aiPredictiveStepMs={preferenceSettings.aiPredictiveStepMs}
