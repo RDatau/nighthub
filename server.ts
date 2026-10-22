@@ -19,25 +19,186 @@ const PORT = 3000;
 
 app.use(express.json({ limit: "25mb" }));
 
-// Helper to get GoogleGenAI client with custom or default API key
-let defaultAiClient: GoogleGenAI | null = null;
-
-function getGenAI(customKey?: string): GoogleGenAI {
-  let keyToUse = '';
-  if (customKey && customKey.trim()) {
-    const cleaned = customKey
+// Helper to parse multiple Gemini API Keys (separated by Enter, commas, spaces, etc.)
+export function parseGeminiApiKeys(input?: string): string[] {
+  const keys: string[] = [];
+  if (input && typeof input === 'string') {
+    const parsed = input
       .split(/[\r\n,;\s]+/)
-      .map(k => k.trim().replace(/^["']|["']$/g, ''))
+      .map(k => k.trim()
+        .replace(/^(?:GEMINI_API_KEY|API_KEY|KEY)\s*[:=]\s*/i, '')
+        .replace(/^["']|["']$/g, '')
+        .trim()
+      )
       .filter(k => k.length > 10);
-    keyToUse = cleaned[0] || customKey.trim().replace(/[\r\n]+/g, '');
-  } else {
-    keyToUse = process.env.GEMINI_API_KEY || '';
+    keys.push(...parsed);
   }
 
+  // Also include environment key if present
+  if (process.env.GEMINI_API_KEY) {
+    const envKeys = process.env.GEMINI_API_KEY
+      .split(/[\r\n,;\s]+/)
+      .map(k => k.trim().replace(/^["']|["']$/g, '').trim())
+      .filter(k => k.length > 10);
+    keys.push(...envKeys);
+  }
+
+  // Deduplicate while preserving order
+  const uniqueKeys: string[] = [];
+  for (const k of keys) {
+    if (!uniqueKeys.includes(k)) {
+      uniqueKeys.push(k);
+    }
+  }
+  return uniqueKeys;
+}
+
+// Key rotation state & 429 tracking (matched with Lumina geminiService logic)
+let currentGeminiKeyIndex = 0;
+const exhaustedGeminiKeysMap = new Map<string, number>();
+const GEMINI_KEY_COOLDOWN_MS = 60 * 1000; // 60s cooldown for keys hitting 429 quota
+
+export function markGeminiKeyExhausted(key: string) {
+  if (key) {
+    exhaustedGeminiKeysMap.set(key, Date.now());
+  }
+}
+
+export function getNextAvailableGeminiKey(keys: string[]): { key: string; index: number } | null {
+  if (!keys || keys.length === 0) return null;
+  const now = Date.now();
+
+  // Clear keys whose cooldown period has expired
+  for (const [key, timestamp] of exhaustedGeminiKeysMap.entries()) {
+    if (now - timestamp > GEMINI_KEY_COOLDOWN_MS) {
+      exhaustedGeminiKeysMap.delete(key);
+    }
+  }
+
+  // Search starting from current index for an unexhausted key
+  for (let i = 0; i < keys.length; i++) {
+    const idx = (currentGeminiKeyIndex + i) % keys.length;
+    const candidate = keys[idx];
+    if (!exhaustedGeminiKeysMap.has(candidate)) {
+      currentGeminiKeyIndex = idx;
+      return { key: candidate, index: idx };
+    }
+  }
+
+  // If all keys are in cooldown, pick the one that has been in cooldown the longest
+  let oldestKey = keys[currentGeminiKeyIndex % keys.length];
+  let oldestTime = Infinity;
+  for (let i = 0; i < keys.length; i++) {
+    const candidate = keys[i];
+    const time = exhaustedGeminiKeysMap.get(candidate) || 0;
+    if (time < oldestTime) {
+      oldestTime = time;
+      oldestKey = candidate;
+      currentGeminiKeyIndex = i;
+    }
+  }
+  return { key: oldestKey, index: currentGeminiKeyIndex };
+}
+
+export function rotateGeminiKey(keys: string[]): string | null {
+  if (!keys || keys.length === 0) return null;
+  currentGeminiKeyIndex = (currentGeminiKeyIndex + 1) % keys.length;
+  const nextKey = keys[currentGeminiKeyIndex];
+  console.log(`[Gemini-Rotation] Beralih ke Key #${currentGeminiKeyIndex + 1}/${keys.length} (${nextKey.slice(0, 4)}...${nextKey.slice(-4)})`);
+  return nextKey;
+}
+
+export async function executeWithKeyRotation<T>(
+  customKeyInput: string | undefined,
+  operation: (ai: GoogleGenAI, activeKey: string, keyIndex: number, totalKeys: number) => Promise<T>,
+  options: { maxRetries?: number; operationName?: string } = {}
+): Promise<T> {
+  const allKeys = parseGeminiApiKeys(customKeyInput);
+  if (allKeys.length === 0) {
+    throw new Error("Tidak ada Gemini API Key yang valid ditemukan. Masukkan API Key Anda di menu Pengaturan.");
+  }
+
+  const opName = options.operationName || "Gemini-Operation";
+  const totalAttempts = allKeys.length > 1 ? allKeys.length : (options.maxRetries ?? 2) + 1;
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    const keyObj = getNextAvailableGeminiKey(allKeys);
+    const activeKey = keyObj?.key || allKeys[0];
+    const keyIndex = keyObj?.index ?? 0;
+
+    const ai = new GoogleGenAI({
+      apiKey: activeKey,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+
+    try {
+      return await operation(ai, activeKey, keyIndex, allKeys.length);
+    } catch (error: any) {
+      lastError = error;
+      const errorMsg = (error.message || "").toLowerCase();
+      const status = error.status || error.code;
+
+      const isQuotaError =
+        errorMsg.includes("429") ||
+        errorMsg.includes("resource_exhausted") ||
+        errorMsg.includes("quota") ||
+        errorMsg.includes("rate limit") ||
+        status === "RESOURCE_EXHAUSTED" ||
+        status === 429;
+
+      const isKeyInvalid =
+        errorMsg.includes("api_key_invalid") ||
+        errorMsg.includes("not valid") ||
+        errorMsg.includes("permission_denied") ||
+        status === 403;
+
+      const isConnectionError =
+        errorMsg.includes("fetch failed") ||
+        errorMsg.includes("network") ||
+        errorMsg.includes("econnreset") ||
+        errorMsg.includes("etimedout") ||
+        errorMsg.includes("timeout") ||
+        errorMsg.includes("socket") ||
+        errorMsg.includes("500") ||
+        errorMsg.includes("503") ||
+        status === 500 ||
+        status === 503;
+
+      if ((isQuotaError || isKeyInvalid || isConnectionError) && allKeys.length > 1 && attempt < totalAttempts - 1) {
+        console.warn(`[${opName}-Rotation] Key #${keyIndex + 1}/${allKeys.length} (${activeKey.slice(0, 4)}...${activeKey.slice(-4)}) terkena ${isQuotaError ? '429 Quota Exceeded' : isKeyInvalid ? 'Invalid/Permission Error' : 'Connection Error'}. Merotasi ke Key berikutnya (Percobaan ${attempt + 1}/${totalAttempts})...`);
+        markGeminiKeyExhausted(activeKey);
+        rotateGeminiKey(allKeys);
+        const waitTime = isConnectionError ? 500 : 200;
+        await new Promise((r) => setTimeout(r, waitTime));
+        continue;
+      }
+
+      if (isQuotaError && allKeys.length === 1 && attempt < totalAttempts - 1) {
+        const delay = Math.pow(2, attempt + 1) * 1000;
+        console.warn(`[${opName}-Retry] Quota hit 429 pada single key, retry in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw lastError;
+}
+
+// Single key helper fallback
+function getGenAI(customKey?: string): GoogleGenAI {
+  const keys = parseGeminiApiKeys(customKey);
+  const keyToUse = keys[0] || process.env.GEMINI_API_KEY || '';
   if (!keyToUse) {
     throw new Error("GEMINI_API_KEY environment variable is missing and no custom key was provided.");
   }
-
   return new GoogleGenAI({
     apiKey: keyToUse,
     httpOptions: {
@@ -48,41 +209,56 @@ function getGenAI(customKey?: string): GoogleGenAI {
   });
 }
 
-
-
 // API Endpoint to verify Gemini API Key
 app.post("/api/ai/verify-key", async (req, res) => {
   try {
     const { apiKey } = req.body;
-    const ai = getGenAI(apiKey);
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite",
-      contents: [{ parts: [{ text: "ping" }] }],
-      config: {
-        safetySettings: safetySettings as any,
-      },
-    });
-    if (response.text) {
-      res.json({ success: true, message: "Gemini API Key valid!" });
-    } else {
-      res.status(400).json({ success: false, error: "Respons kosong dari Gemini API." });
+    const keys = parseGeminiApiKeys(apiKey);
+    if (keys.length === 0) {
+      return res.status(400).json({ success: false, error: "Tidak ada API Key yang valid ditemukan." });
     }
+
+    await executeWithKeyRotation(
+      apiKey,
+      async (ai, activeKey, idx, total) => {
+        const response = await ai.models.generateContent({
+          model: "gemini-3.1-flash-lite",
+          contents: [{ parts: [{ text: "ping" }] }],
+          config: {
+            safetySettings: safetySettings as any,
+          },
+        });
+        if (response.text) {
+          return true;
+        }
+        throw new Error("Respons kosong dari Gemini API.");
+      },
+      { operationName: "Verify-Key" }
+    );
+
+    res.json({
+      success: true,
+      totalKeys: keys.length,
+      message: `${keys.length} Gemini API Key terdaftar. Rotasi otomatis aktif & siap digunakan!`
+    });
   } catch (error: any) {
-    console.error("Error verifying Gemini API key:", error);
-    res.status(400).json({ success: false, error: error.message || "API Key tidak valid atau kuota habis." });
+    console.error("Error verifying Gemini API keys:", error);
+    res.status(400).json({ success: false, error: error.message || "Semua API Key gagal atau kuota habis." });
   }
 });
 
-function buildTtsPart(text: string, modelName: string, styleInstruction?: string) {
+export const isTtsModelStreamSupported = (modelName: string): boolean => {
+  const m = (modelName || '').toLowerCase().trim();
+  return m.includes('3.8') || m.includes('3.1') || m.includes('live');
+};
+
+export function buildTtsPart(text: string, modelName: string, styleInstruction?: string) {
   const cleanText = text.replace(/[*#_~`]/g, "").slice(0, 500).trim();
   const isModel38 = modelName && modelName.includes('3.8');
   
   if (isModel38 && styleInstruction && styleInstruction.trim()) {
     return {
-      text: `Speak this text: "${cleanText}",`,
-      speechMetadata: {
-        style: styleInstruction.trim()
-      }
+      text: `Speak this text: "${cleanText}",\nspeechMetadata: {\n  style: ${styleInstruction.trim()}\n}`
     };
   }
   
@@ -93,69 +269,112 @@ function buildTtsPart(text: string, modelName: string, styleInstruction?: string
 // API Endpoint for generating standalone TTS audio for specific text
 app.post("/api/ai/tts", async (req, res) => {
   try {
-    const { text, apiKey, ttsModel = "gemini-3.1-flash-tts-preview", voice = "Kore", aiStyleInstruction } = req.body;
+    const { text, apiKey, ttsModel = "gemini-3.8-flash-tts", voice = "Kore", aiStyleInstruction, temperature = 1.0 } = req.body;
     if (!text || !text.trim()) {
       return res.status(400).json({ success: false, error: "Text is required for TTS." });
     }
 
-    const ai = getGenAI(apiKey);
-    let audioBase64: string | null = null;
-    let mimeType: string = "audio/pcm";
-
     const voiceName = voice || "Kore";
-    const primaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : "gemini-3.1-flash-tts-preview";
+    const primaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : "gemini-3.8-flash-tts";
     const ttsPart = buildTtsPart(text, primaryModel, aiStyleInstruction);
+    const supportsStreaming = isTtsModelStreamSupported(primaryModel);
 
-    try {
-      const speechResponse = await ai.models.generateContent({
-        model: primaryModel,
-        contents: [{ parts: [ttsPart] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName },
-            },
-          },
-          safetySettings: safetySettings as any,
-        },
-      });
+    const result = await executeWithKeyRotation(
+      apiKey,
+      async (ai, activeKey, keyIdx, totalKeys) => {
+        let audioBase64: string | null = null;
+        let mimeType: string = "audio/pcm";
 
-      const part = speechResponse.candidates?.[0]?.content?.parts?.[0];
-      audioBase64 = part?.inlineData?.data || null;
-      mimeType = part?.inlineData?.mimeType || "audio/pcm";
-    } catch (primaryErr) {
-      console.warn("Primary TTS endpoint warning, trying gemini-2.5-flash fallback:", primaryErr);
-      try {
-        const fallbackResponse = await ai.models.generateContent({
-          model: "gemini-1.5-flash",
-          contents: [{ parts: [buildTtsPart(text, "gemini-1.5-flash", aiStyleInstruction)] }],
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName },
+        // Jika model mendukung streaming, coba generateContentStream terlebih dahulu
+        if (supportsStreaming) {
+          try {
+            const stream = await ai.models.generateContentStream({
+              model: primaryModel,
+              contents: [{ parts: [ttsPart] }],
+              config: {
+                responseModalities: [Modality.AUDIO],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName },
+                  },
+                },
+                temperature: typeof temperature === 'number' ? temperature : 1.0,
+                safetySettings: safetySettings as any,
               },
-            },
-            safetySettings: safetySettings as any,
-          },
-        });
-        const part = fallbackResponse.candidates?.[0]?.content?.parts?.[0];
-        audioBase64 = part?.inlineData?.data || null;
-        mimeType = part?.inlineData?.mimeType || "audio/pcm";
-      } catch (fbErr) {
-        console.error("Fallback TTS generation failed:", fbErr);
-      }
-    }
+            });
 
-    if (audioBase64) {
-      res.json({ success: true, audio: audioBase64, mimeType });
-    } else {
-      res.status(500).json({ success: false, error: "Gagal menghasilkan audio TTS Suara AI." });
-    }
+            const pcmChunks: Buffer[] = [];
+            for await (const chunk of stream) {
+              const parts = chunk.candidates?.[0]?.content?.parts;
+              if (parts) {
+                for (const part of parts) {
+                  if (part.inlineData?.data) {
+                    pcmChunks.push(Buffer.from(part.inlineData.data, "base64"));
+                    if (part.inlineData.mimeType) {
+                      mimeType = part.inlineData.mimeType;
+                    }
+                  }
+                }
+              }
+            }
+
+            if (pcmChunks.length > 0) {
+              audioBase64 = Buffer.concat(pcmChunks).toString("base64");
+            }
+          } catch (streamErr: any) {
+            console.warn(`[TTS-Stream] Streaming dengan model ${primaryModel} gagal/tidak didukung, coba generateContent:`, streamErr?.message || streamErr);
+            const msg = (streamErr?.message || "").toLowerCase();
+            // Jika error 429 kuota habis, lempar error agar executeWithKeyRotation merotasi ke key berikutnya!
+            if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted") || msg.includes("403")) {
+              throw streamErr;
+            }
+          }
+        }
+
+        // Fallback ke generateContent utuh jika streaming tidak menghasilkan audio
+        if (!audioBase64) {
+          const speechResponse = await ai.models.generateContent({
+            model: primaryModel,
+            contents: [{ parts: [ttsPart] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName },
+                },
+              },
+              temperature: typeof temperature === 'number' ? temperature : 1.0,
+              safetySettings: safetySettings as any,
+            },
+          });
+
+          const candidates = speechResponse.candidates || [];
+          for (const cand of candidates) {
+            const parts = cand.content?.parts || [];
+            for (const part of parts) {
+              if (part.inlineData?.data) {
+                audioBase64 = part.inlineData.data;
+                mimeType = part.inlineData.mimeType || mimeType;
+                break;
+              }
+            }
+            if (audioBase64) break;
+          }
+        }
+
+        if (!audioBase64) {
+          throw new Error("Gagal menghasilkan audio: Model tidak mengembalikan audio chunk.");
+        }
+
+        return { audio: audioBase64, mimeType };
+      },
+      { operationName: "TTS-Speech" }
+    );
+
+    res.json({ success: true, audio: result.audio, mimeType: result.mimeType });
   } catch (err: any) {
-    console.error("Error generating TTS:", err);
-    res.status(500).json({ success: false, error: err.message || "Gagal memproses TTS." });
+    console.error("Error generating TTS across key pool:", err);
+    res.status(500).json({ success: false, error: err.message || "Gagal memproses TTS pada semua API Key." });
   }
 });
 
@@ -190,8 +409,6 @@ app.post("/api/ai/live-comment", async (req, res) => {
       maxOutputTokens = 2048,
       hasActiveVideo = true,
     } = req.body;
-
-    const ai = getGenAI(apiKey);
 
     const langTarget = aiResponseLanguage && aiResponseLanguage !== 'auto' ? aiResponseLanguage : lang;
     let languageInstruction = "Bahasa Indonesia";
@@ -284,79 +501,124 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
       genConfig.thinkingConfig = { thinkingBudget: 2048 };
     }
 
-    let response: any;
-    try {
-      response = await ai.models.generateContent({
-        model: targetModel,
-        contents: { parts: contentsParts },
-        config: genConfig,
-      });
-    } catch (genErr: any) {
-      console.warn("Primary generateContent failed with config, retrying with clean fallback config:", genErr?.message || genErr);
-      // Fallback clean config to guarantee no 400 INVALID_ARGUMENT errors
-      response = await ai.models.generateContent({
-        model: targetModel,
-        contents: { parts: contentsParts },
-        config: {
-          systemInstruction,
-          temperature: typeof temperature === 'number' ? temperature : 0.85,
-          safetySettings: computedSafetySettings,
-        },
-      });
-    }
-
-    const replyText = response.text || "Saya tidak dapat menganalisis video saat ini.";
+    // Execute Chat Commentary with Key Rotation
+    const replyText = await executeWithKeyRotation(
+      apiKey,
+      async (ai, activeKey, keyIdx, totalKeys) => {
+        let response: any;
+        try {
+          response = await ai.models.generateContent({
+            model: targetModel,
+            contents: { parts: contentsParts },
+            config: genConfig,
+          });
+        } catch (genErr: any) {
+          const msg = (genErr?.message || "").toLowerCase();
+          if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted") || msg.includes("403")) {
+            throw genErr; // Lempar agar executeWithKeyRotation merotasi ke key berikutnya!
+          }
+          console.warn("Primary generateContent failed with config, retrying with clean fallback config:", genErr?.message || genErr);
+          response = await ai.models.generateContent({
+            model: targetModel,
+            contents: { parts: contentsParts },
+            config: {
+              systemInstruction,
+              temperature: typeof temperature === 'number' ? temperature : 0.85,
+              safetySettings: computedSafetySettings,
+            },
+          });
+        }
+        return response.text || "Saya tidak dapat menganalisis video saat ini.";
+      },
+      { operationName: "Live-Comment" }
+    );
 
     let audioBase64: string | null = null;
     let mimeType: string = "audio/pcm";
 
-    // Optional Speech Generation if voice is enabled or in live_call mode
+    // Optional Speech Generation if voice is enabled or in live_call mode with Key Rotation
     if ((voiceEnabled || mode === "live_call") && replyText) {
-      const cleanReply = replyText.replace(/[*#_~`]/g, "").slice(0, 400).trim();
-      const voiceName = voice || "Kore";
-      const ttsPrimaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : (aiTtsModel || "gemini-3.1-flash-tts-preview");
-      const ttsPart = buildTtsPart(cleanReply, ttsPrimaryModel, aiStyleInstruction);
-
       try {
-        const speechResponse = await ai.models.generateContent({
-          model: ttsPrimaryModel,
-          contents: [{ parts: [ttsPart] }],
-          config: {
-            responseModalities: [Modality.AUDIO],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName },
-              },
-            },
-            safetySettings: computedSafetySettings as any,
-          },
-        });
+        const ttsPrimaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : (aiTtsModel || "gemini-3.8-flash-tts");
+        const voiceName = voice || "Kore";
+        const cleanReply = replyText.replace(/[*#_~`]/g, "").slice(0, 400).trim();
+        const ttsPart = buildTtsPart(cleanReply, ttsPrimaryModel, aiStyleInstruction);
+        const supportsStreaming = isTtsModelStreamSupported(ttsPrimaryModel);
 
-        const part = speechResponse.candidates?.[0]?.content?.parts?.[0];
-        audioBase64 = part?.inlineData?.data || null;
-        mimeType = part?.inlineData?.mimeType || "audio/pcm";
-      } catch (ttsErr) {
-        console.warn("Primary TTS Generation warning, trying gemini-3.1-flash fallback:", ttsErr);
-        try {
-          const fallbackResponse = await ai.models.generateContent({
-            model: "gemini-1.5-flash",
-            contents: [{ parts: [buildTtsPart(cleanReply, "gemini-1.5-flash", aiStyleInstruction)] }],
-            config: {
-              responseModalities: [Modality.AUDIO],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName },
+        const ttsResult = await executeWithKeyRotation(
+          apiKey,
+          async (ai, activeKey, keyIdx, totalKeys) => {
+            let chunkAudio: string | null = null;
+            let chunkMime = "audio/pcm";
+
+            if (supportsStreaming) {
+              try {
+                const stream = await ai.models.generateContentStream({
+                  model: ttsPrimaryModel,
+                  contents: [{ parts: [ttsPart] }],
+                  config: {
+                    responseModalities: [Modality.AUDIO],
+                    speechConfig: {
+                      voiceConfig: {
+                        prebuiltVoiceConfig: { voiceName },
+                      },
+                    },
+                    safetySettings: computedSafetySettings as any,
+                  },
+                });
+
+                const pcmChunks: Buffer[] = [];
+                for await (const chunk of stream) {
+                  const parts = chunk.candidates?.[0]?.content?.parts;
+                  if (parts) {
+                    for (const part of parts) {
+                      if (part.inlineData?.data) {
+                        pcmChunks.push(Buffer.from(part.inlineData.data, "base64"));
+                        if (part.inlineData.mimeType) chunkMime = part.inlineData.mimeType;
+                      }
+                    }
+                  }
+                }
+                if (pcmChunks.length > 0) {
+                  chunkAudio = Buffer.concat(pcmChunks).toString("base64");
+                }
+              } catch (stErr: any) {
+                const msg = (stErr?.message || "").toLowerCase();
+                if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted") || msg.includes("403")) {
+                  throw stErr;
+                }
+              }
+            }
+
+            if (!chunkAudio) {
+              const speechResponse = await ai.models.generateContent({
+                model: ttsPrimaryModel,
+                contents: [{ parts: [ttsPart] }],
+                config: {
+                  responseModalities: [Modality.AUDIO],
+                  speechConfig: {
+                    voiceConfig: {
+                      prebuiltVoiceConfig: { voiceName },
+                    },
+                  },
+                  safetySettings: computedSafetySettings as any,
                 },
-              },
-              safetySettings: computedSafetySettings as any,
-            },
-          });
-          const part = fallbackResponse.candidates?.[0]?.content?.parts?.[0];
-          audioBase64 = part?.inlineData?.data || null;
-          mimeType = part?.inlineData?.mimeType || "audio/pcm";
-        } catch (fallbackErr) {
-          console.warn("Fallback TTS Generation failed:", fallbackErr);
-        }
+              });
+              const part = speechResponse.candidates?.[0]?.content?.parts?.[0];
+              chunkAudio = part?.inlineData?.data || null;
+              chunkMime = part?.inlineData?.mimeType || chunkMime;
+            }
+
+            if (!chunkAudio) throw new Error("AUDIO_GEN_EMPTY");
+            return { audio: chunkAudio, mimeType: chunkMime };
+          },
+          { operationName: "Live-Comment-TTS" }
+        );
+
+        audioBase64 = ttsResult.audio;
+        mimeType = ttsResult.mimeType;
+      } catch (voiceErr: any) {
+        console.warn("Live-Comment speech generation failed across key pool:", voiceErr?.message || voiceErr);
       }
     }
 
@@ -416,76 +678,104 @@ async function startServer() {
 
           const targetModel = (model && model.includes("gemini")) ? model : "gemini-3.1-flash-live-preview";
 
-          try {
-            const ai = getGenAI(apiKey);
-            sessionPromise = ai.live.connect({
-              model: targetModel,
-              config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName: voice || "Kore" },
+          const allKeys = parseGeminiApiKeys(apiKey);
+          let connected = false;
+          const maxAttempts = Math.min(allKeys.length, 5);
+
+          for (let attempt = 0; attempt < Math.max(maxAttempts, 1); attempt++) {
+            const keyObj = getNextAvailableGeminiKey(allKeys);
+            const activeKey = keyObj?.key || allKeys[0] || process.env.GEMINI_API_KEY || '';
+
+            try {
+              const ai = new GoogleGenAI({
+                apiKey: activeKey,
+                httpOptions: { headers: { "User-Agent": "aistudio-build" } },
+              });
+
+              sessionPromise = ai.live.connect({
+                model: targetModel,
+                config: {
+                  responseModalities: [Modality.AUDIO],
+                  speechConfig: {
+                    voiceConfig: {
+                      prebuiltVoiceConfig: { voiceName: voice || "Kore" },
+                    },
+                  },
+                  systemInstruction: systemInstruction || "You are a helpful AI companion.",
+                } as any,
+                callbacks: {
+                  onmessage: (message: LiveServerMessage) => {
+                    if (clientWs.readyState !== WebSocket.OPEN) return;
+
+                    // 1) Audio chunk from model
+                    const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                    if (audioData) {
+                      clientWs.send(JSON.stringify({ type: "audio", data: audioData }));
+                    }
+
+                    // 2) Model text response / output transcription
+                    const textPart = message.serverContent?.modelTurn?.parts?.find((p) => p.text)?.text;
+                    const outputText = message.serverContent?.outputTranscription?.text || textPart;
+                    if (outputText) {
+                      clientWs.send(JSON.stringify({ type: "model_transcript", text: outputText }));
+                    }
+
+                    // 3) User input transcription
+                    const inputText = message.serverContent?.inputTranscription?.text;
+                    if (inputText) {
+                      clientWs.send(JSON.stringify({ type: "user_transcript", text: inputText }));
+                    }
+
+                    // 4) Turn complete
+                    if (message.serverContent?.turnComplete) {
+                      clientWs.send(JSON.stringify({ type: "turn_complete" }));
+                    }
+
+                    // 5) Interrupted (barge-in)
+                    if (message.serverContent?.interrupted) {
+                      clientWs.send(JSON.stringify({ type: "interrupted" }));
+                    }
+                  },
+                  onerror: (err: any) => {
+                    console.error("[Gemini Live API] Session error:", err);
+                    const errMsg = (err?.message || "").toLowerCase();
+                    if (errMsg.includes("429") || errMsg.includes("quota")) {
+                      markGeminiKeyExhausted(activeKey);
+                      rotateGeminiKey(allKeys);
+                    }
+                    if (clientWs.readyState === WebSocket.OPEN) {
+                      clientWs.send(JSON.stringify({ type: "error", error: err?.message || "Live session error" }));
+                    }
+                  },
+                  onclose: () => {
+                    console.log("[Gemini Live API] Session closed");
+                    if (clientWs.readyState === WebSocket.OPEN) {
+                      clientWs.send(JSON.stringify({ type: "closed" }));
+                    }
                   },
                 },
-                systemInstruction: systemInstruction || "You are a helpful AI companion.",
-              } as any,
-              callbacks: {
-                onmessage: (message: LiveServerMessage) => {
-                  if (clientWs.readyState !== WebSocket.OPEN) return;
+              });
 
-                  // 1) Audio chunk from model
-                  const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-                  if (audioData) {
-                    clientWs.send(JSON.stringify({ type: "audio", data: audioData }));
-                  }
+              session = await sessionPromise;
+              connected = true;
 
-                  // 2) Model text response / output transcription
-                  const textPart = message.serverContent?.modelTurn?.parts?.find((p) => p.text)?.text;
-                  const outputText = message.serverContent?.outputTranscription?.text || textPart;
-                  if (outputText) {
-                    clientWs.send(JSON.stringify({ type: "model_transcript", text: outputText }));
-                  }
-
-                  // 3) User input transcription
-                  const inputText = message.serverContent?.inputTranscription?.text;
-                  if (inputText) {
-                    clientWs.send(JSON.stringify({ type: "user_transcript", text: inputText }));
-                  }
-
-                  // 4) Turn complete
-                  if (message.serverContent?.turnComplete) {
-                    clientWs.send(JSON.stringify({ type: "turn_complete" }));
-                  }
-
-                  // 5) Interrupted (barge-in)
-                  if (message.serverContent?.interrupted) {
-                    clientWs.send(JSON.stringify({ type: "interrupted" }));
-                  }
-                },
-                onerror: (err: any) => {
-                  console.error("[Gemini Live API] Session error:", err);
-                  if (clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(JSON.stringify({ type: "error", error: err?.message || "Live session error" }));
-                  }
-                },
-                onclose: () => {
-                  console.log("[Gemini Live API] Session closed");
-                  if (clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(JSON.stringify({ type: "closed" }));
-                  }
-                },
-              },
-            });
-
-            session = await sessionPromise;
-
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(JSON.stringify({ type: "connected" }));
-            }
-          } catch (initErr: any) {
-            console.error("[Gemini Live API] Connect failed:", initErr);
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(JSON.stringify({ type: "error", error: initErr?.message || "Gagal menghubungkan ke Gemini Live API." }));
+              if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({ type: "connected" }));
+              }
+              break;
+            } catch (initErr: any) {
+              const errMsg = (initErr?.message || "").toLowerCase();
+              if ((errMsg.includes("429") || errMsg.includes("quota") || errMsg.includes("resource_exhausted")) && allKeys.length > 1) {
+                console.warn(`[Gemini-Live-WebSocket] Key ${activeKey.slice(0, 4)}... kena 429, merotasi ke key berikutnya...`);
+                markGeminiKeyExhausted(activeKey);
+                rotateGeminiKey(allKeys);
+                continue;
+              }
+              console.error("[Gemini Live API] Connect failed:", initErr);
+              if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(JSON.stringify({ type: "error", error: initErr?.message || "Gagal menghubungkan ke Gemini Live API." }));
+              }
+              break;
             }
           }
         } else if (sessionPromise) {

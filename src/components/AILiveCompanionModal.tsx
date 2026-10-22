@@ -428,6 +428,8 @@ export function AILiveCompanionModal({
     }
   }, [aiMode]);
 
+  const liveKeyIndexRef = useRef<number>(0);
+
   // Live Session Connection Effect using Gemini Live API WebSocket Server
   useEffect(() => {
     if (activeMode !== 'live_call' || !isOpen) {
@@ -463,9 +465,23 @@ export function AILiveCompanionModal({
 
       try {
         const rawKey = geminiApiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_api_key') : '') || '';
-        const cleanedKeys = rawKey.split(/[\r\n,;\s]+/).map(k => k.trim().replace(/^["']|["']$/g, '')).filter(k => k.length > 10);
-        const keyToUse = cleanedKeys[0] || rawKey.trim().replace(/[\r\n]+/g, '');
-        const ai = new GoogleGenAI({ apiKey: keyToUse });
+        const cleanedKeys = rawKey
+          .split(/[\r\n,;\s]+/)
+          .map(k => k.trim().replace(/^(?:GEMINI_API_KEY|API_KEY|KEY)\s*[:=]\s*/i, '').replace(/^["']|["']$/g, '').trim())
+          .filter(k => k.length > 10);
+        
+        const currentKeyIdx = liveKeyIndexRef.current % Math.max(cleanedKeys.length, 1);
+        const keyToUse = cleanedKeys.length > 0 ? cleanedKeys[currentKeyIdx] : rawKey.trim().replace(/[\r\n]+/g, '');
+        console.log(`[Gemini-Live] Connecting with Key #${currentKeyIdx + 1}/${cleanedKeys.length || 1} (${keyToUse.slice(0, 4)}...${keyToUse.slice(-4)})`);
+
+        const ai = new GoogleGenAI({
+          apiKey: keyToUse,
+          httpOptions: {
+            headers: {
+              'User-Agent': 'aistudio-build',
+            },
+          },
+        });
 
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         if (!isMounted) {
@@ -644,8 +660,21 @@ Instruksi Perilaku Live Call:
             onerror: (e: any) => {
               console.error('Gemini Live session error:', e);
               if (isMounted) {
-                const msg = e.message || '';
-                if (msg.includes('429')) {
+                const msg = (e.message || '').toLowerCase();
+                const isQuota = msg.includes('429') || msg.includes('quota') || msg.includes('resource_exhausted');
+                
+                if (isQuota && cleanedKeys.length > 1) {
+                  liveKeyIndexRef.current = (liveKeyIndexRef.current + 1) % cleanedKeys.length;
+                  console.warn(`[Gemini-Live] Key kena quota 429, merotasi ke Key #${(liveKeyIndexRef.current % cleanedKeys.length) + 1}...`);
+                  setLiveStatus('RECONNECTING...');
+                  setLiveErrorMessage(`Kuota Key #${(currentKeyIdx + 1)} habis, beralih ke Key #${(liveKeyIndexRef.current % cleanedKeys.length) + 1}...`);
+                  setTimeout(() => {
+                    if (isMounted) setReconnectTrigger(prev => prev + 1);
+                  }, 1500);
+                  return;
+                }
+
+                if (isQuota) {
                   setIsQuotaError(true);
                   isQuotaErrorRef.current = true;
                   setLiveStatus('QUOTA EXHAUSTED');
@@ -674,6 +703,19 @@ Instruksi Perilaku Live Call:
         sessionRef.current = session;
       } catch (err: any) {
         if (isMounted) {
+          const errMsg = (err?.message || '').toLowerCase();
+          const rawKey = geminiApiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_api_key') : '') || '';
+          const cleanedKeys = rawKey.split(/[\r\n,;\s]+/).filter(k => k.length > 10);
+
+          if ((errMsg.includes('429') || errMsg.includes('quota')) && cleanedKeys.length > 1) {
+            liveKeyIndexRef.current = (liveKeyIndexRef.current + 1) % cleanedKeys.length;
+            setLiveErrorMessage(`Key kena limit kuota, mencoba Key #${(liveKeyIndexRef.current % cleanedKeys.length) + 1}...`);
+            setTimeout(() => {
+              if (isMounted) setReconnectTrigger(prev => prev + 1);
+            }, 1500);
+            return;
+          }
+
           setLiveStatus('ERROR');
           setLiveErrorMessage('Gagal menyambung ke Live Agent.');
         }
@@ -1293,7 +1335,7 @@ Instruksi Perilaku Live Call:
         body: JSON.stringify({
           text: msg.text,
           apiKey: geminiApiKey,
-          ttsModel: aiTtsModel || aiLiveModel || 'gemini-3.1-flash-tts-preview',
+          ttsModel: aiTtsModel || 'gemini-3.8-flash-tts',
           voice: aiVoice || 'Kore',
           aiStyleInstruction,
         }),
@@ -1390,6 +1432,7 @@ Instruksi Perilaku Live Call:
           frameImage: frameImg,
           aiCustomPersona,
           aiLanguageStyle,
+          aiStyleInstruction,
           voiceEnabled: isVoiceNeeded,
           chatHistory: historyBefore.slice(-6),
           apiKey: geminiApiKey,
@@ -1397,7 +1440,7 @@ Instruksi Perilaku Live Call:
           aiResponseLanguage,
           chatModel: aiChatModel,
           liveModel: aiLiveModel,
-          ttsModel: aiTtsModel || 'gemini-3.1-flash-tts-preview',
+          ttsModel: aiTtsModel || 'gemini-3.8-flash-tts',
           mode: activeMode,
           voice: aiVoice || 'Kore',
           temperature: aiTemperature ?? 0.85,
@@ -1489,6 +1532,7 @@ Instruksi Perilaku Live Call:
           frameImage: frameImg,
           aiCustomPersona,
           aiLanguageStyle,
+          aiStyleInstruction,
           voiceEnabled: isVoiceNeeded,
           chatHistory: historyBefore.slice(-6),
           apiKey: geminiApiKey,
@@ -1496,7 +1540,7 @@ Instruksi Perilaku Live Call:
           aiResponseLanguage,
           chatModel: aiChatModel,
           liveModel: aiLiveModel,
-          ttsModel: aiTtsModel || 'gemini-3.1-flash-tts-preview',
+          ttsModel: aiTtsModel || 'gemini-3.8-flash-tts',
           mode: activeMode,
           voice: aiVoice || 'Kore',
           temperature: (aiTemperature ?? 0.85) + 0.05,
@@ -1609,7 +1653,7 @@ Instruksi Perilaku Live Call:
             aiResponseLanguage,
             chatModel: aiChatModel,
             liveModel: aiLiveModel,
-            ttsModel: aiTtsModel || 'gemini-3.1-flash-tts-preview',
+            ttsModel: aiTtsModel || 'gemini-3.8-flash-tts',
             mode: activeMode,
             voice: aiVoice || 'Kore',
             temperature: aiTemperature ?? 0.85,

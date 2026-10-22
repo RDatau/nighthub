@@ -196,7 +196,7 @@ export const SettingsModal = ({
       if (data.success) {
         setApiKeyStatus({
           success: true,
-          message: lang === 'en' ? 'API Key is valid and working!' : 'API Key valid & siap digunakan!'
+          message: data.message || (lang === 'en' ? 'API Key is valid and working!' : 'API Key valid & siap digunakan!')
         });
       } else {
         setApiKeyStatus({
