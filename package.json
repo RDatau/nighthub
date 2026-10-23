@@ -15,10 +15,10 @@
     "clean": "rm -rf dist release",
     "lint": "tsc --noEmit",
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron .\"",
-    "electron:build": "npm run build && electron-builder --win",
-    "electron:build:dir": "npm run build && electron-builder --dir",
-    "electron:build:win": "npm run build && electron-builder --win",
-    "electron:build:linux": "npm run build && electron-builder --linux"
+    "electron:build": "npm run build && node --max-old-space-size=4096 ./node_modules/electron-builder/out/cli/cli.js --win",
+    "electron:build:dir": "npm run build && node --max-old-space-size=4096 ./node_modules/electron-builder/out/cli/cli.js --dir",
+    "electron:build:win": "npm run build && node --max-old-space-size=4096 ./node_modules/electron-builder/out/cli/cli.js --win",
+    "electron:build:linux": "npm run build && node --max-old-space-size=4096 ./node_modules/electron-builder/out/cli/cli.js --linux"
   },
   "build": {
     "appId": "com.ryandatau.nighthub",
