@@ -5639,11 +5639,8 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
       '-protocol_whitelist file,http,https,tcp,tls,crypto',
       '-rw_timeout 30000000',
       '-user_agent', userAgent,
-      '-probesize', '50M',
-      '-analyzeduration', '50M',
-      '-fflags', '+genpts+igndts',
-      '-use_wallclock_as_timestamps', '1',
-      '-r', '25',
+      '-probesize', '10M',
+      '-analyzeduration', '10M',
       '-ignore_unknown'
     ];
 
