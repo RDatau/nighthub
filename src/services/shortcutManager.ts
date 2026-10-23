@@ -64,6 +64,12 @@ export const DEFAULT_COMMANDS: CommandDefinition[] = [
     defaultKeys: [],
   },
   {
+    id: 'toggleAllControls',
+    nameKey: 'shortcutToggleAllControls',
+    category: 'display',
+    defaultKeys: [],
+  },
+  {
     id: 'seekBackward10',
     nameKey: 'shortcutSeek10sBackward',
     category: 'playback',
