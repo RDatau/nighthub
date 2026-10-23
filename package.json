@@ -12,10 +12,13 @@
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "preview": "vite preview",
-    "clean": "rm -rf dist",
+    "clean": "rm -rf dist release",
     "lint": "tsc --noEmit",
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron .\"",
-    "electron:build": "npm run build && electron-builder"
+    "electron:build": "npm run build && electron-builder --win",
+    "electron:build:dir": "npm run build && electron-builder --dir",
+    "electron:build:win": "npm run build && electron-builder --win",
+    "electron:build:linux": "npm run build && electron-builder --linux"
   },
   "build": {
     "appId": "com.ryandatau.nighthub",
@@ -52,6 +55,7 @@
       }
     ],
     "directories": {
+      "output": "release",
       "buildResources": "public"
     },
     "files": [
@@ -70,9 +74,7 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
     },
-    "linux": {
-      "target": "AppImage"
-    },
+    "linux": null,
     "asar": true,
     "asarUnpack": [
       "node_modules/@ffmpeg-installer/**",

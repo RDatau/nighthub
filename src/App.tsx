@@ -1465,7 +1465,7 @@ export default function App() {
       let loadedMarkers = await dbService.getMarkers(id);
 
       // If it's a local file and we have MediaInfo, try to extract chapters
-      if (file && file.name.toLowerCase().endsWith('.mkv')) {
+      if (file && file.size && file.size > 0 && file.name.toLowerCase().endsWith('.mkv')) {
         let mediainfo: any = null;
         try {
           mediainfo = await MediaInfoFactory({
@@ -1477,15 +1477,24 @@ export default function App() {
               return prefix + path;
             }
           });
-          const getSize = () => file.size;
+          const fileSize = file.size;
+          const getSize = () => fileSize;
           const readChunk = (chunkSize: number, offset: number) =>
-            new Promise<Uint8Array>((resolve, reject) => {
+            new Promise<Uint8Array>((resolve) => {
+              if (offset >= fileSize) {
+                return resolve(new Uint8Array(0));
+              }
               const reader = new FileReader();
               reader.onload = (e) => {
-                if (e.target?.error) reject(e.target.error);
-                resolve(new Uint8Array(e.target?.result as ArrayBuffer));
+                if (e.target?.result instanceof ArrayBuffer) {
+                  resolve(new Uint8Array(e.target.result));
+                } else {
+                  resolve(new Uint8Array(0));
+                }
               };
-              reader.readAsArrayBuffer(file.slice(offset, offset + chunkSize));
+              reader.onerror = () => resolve(new Uint8Array(0));
+              const end = Math.min(offset + chunkSize, fileSize);
+              reader.readAsArrayBuffer(file.slice(offset, end));
             });
 
           try {
@@ -1548,16 +1557,16 @@ export default function App() {
               }
             }
           } catch (analysisErr) {
-            console.error("MediaInfo analysis failed, skipping chapters:", analysisErr);
+            console.warn("MediaInfo analysis skipped for MKV chapters:", analysisErr);
           }
         } catch (err) {
-          console.error("Failed to parse MKV chapters:", err);
+          console.warn("MediaInfo MKV chapters skipped:", err);
         } finally {
           if (mediainfo) {
             try {
               mediainfo.close();
             } catch (e) {
-              console.error("Failed to close mediainfo", e);
+              // ignore
             }
           }
         }
@@ -1964,12 +1973,16 @@ export default function App() {
   // --- Playback Controls ---
   useEffect(() => {
     if (videoRef.current) {
+      if (!player.videoSrc) {
+        if (player.isPlaying) player.setIsPlaying(false);
+        return;
+      }
       if (player.isPlaying) {
         const playPromise = videoRef.current.play();
         if (playPromise !== undefined) {
           playPromise.catch(error => {
-            if (error.name !== 'AbortError') {
-              console.error("Playback prevented:", error);
+            if (error.name !== 'AbortError' && error.name !== 'NotSupportedError') {
+              console.warn("Playback prevented:", error);
               player.setIsPlaying(false);
             }
           });
@@ -2700,9 +2713,15 @@ export default function App() {
 
   const handleVideoError = (e: any) => {
     const video = e.target as HTMLVideoElement;
+    if (!video || !player.videoSrc || !video.src || video.src === window.location.href || video.src === 'about:blank') {
+      return;
+    }
     let errorMsg = t('videoPlayFailed', preferenceSettings.language || 'id');
     
     if (video.error) {
+      if (video.error.code === 4 && !player.videoSrc) {
+        return;
+      }
       switch (video.error.code) {
         case 1: errorMsg = t('videoErrorAborted', preferenceSettings.language || 'id'); break;
         case 2: errorMsg = t('videoErrorNetwork', preferenceSettings.language || 'id'); break;
@@ -2713,7 +2732,7 @@ export default function App() {
     
     player.setVideoError(errorMsg);
     player.setIsPlaying(false);
-    electron.logToMain(`Video Error: ${errorMsg} (Code: ${video.error?.code})`);
+    console.warn(`Video Error: ${errorMsg} (Code: ${video.error?.code})`);
   };
 
   const handleNetworkStream = () => {

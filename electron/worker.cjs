@@ -2,6 +2,13 @@
 // Background memory manager for performance optimization
 const { parentPort } = require('electron');
 
+process.on('uncaughtException', (err) => {
+  console.warn('[WORKER EXCEPTION SUPPRESSED]:', err && (err.message || String(err)));
+});
+process.on('unhandledRejection', (reason) => {
+  console.warn('[WORKER REJECTION SUPPRESSED]:', reason);
+});
+
 console.log('[WORKER] Background utility process is running...');
 
 if (parentPort) {

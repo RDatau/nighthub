@@ -31,12 +31,17 @@ export const AboutModal = ({
     const filePath = (currentFile as any)?.path || currentFile?.name;
 
     if (currentFile && filePath && filePath !== analyzedFilePath) {
+      if (!currentFile.size || currentFile.size <= 0) {
+        setIsLoadingInfo(false);
+        return;
+      }
       let isMounted = true;
       const fetchInfo = async () => {
         setIsLoadingInfo(true);
+        let mediainfo: any = null;
         try {
           const MediaInfoFactory = (await import('mediainfo.js')).default;
-          const mediainfo = await MediaInfoFactory({
+          mediainfo = await MediaInfoFactory({
             format: 'object',
             locateFile: (path, prefix) => {
               if (path.endsWith('.wasm')) {
@@ -55,31 +60,40 @@ export const AboutModal = ({
             getSize = () => stat.size;
             readChunk = (chunkSize, offset) => {
               return new Promise((resolve, reject) => {
+                if (offset >= stat.size) {
+                  return resolve(new Uint8Array(0));
+                }
                 fs.open((currentFile as any).path, 'r', (err: any, fd: any) => {
                   if (err) return reject(err);
-                  const buffer = Buffer.alloc(chunkSize);
-                  fs.read(fd, buffer, 0, chunkSize, offset, (err: any, bytesRead: number, buffer: Buffer) => {
+                  const actualReadSize = Math.min(chunkSize, stat.size - offset);
+                  const buffer = Buffer.alloc(actualReadSize);
+                  fs.read(fd, buffer, 0, actualReadSize, offset, (readErr: any, bytesRead: number, buf: Buffer) => {
                     fs.close(fd, () => {});
-                    if (err) return reject(err);
-                    resolve(new Uint8Array(buffer.slice(0, bytesRead)));
+                    if (readErr) return reject(readErr);
+                    resolve(new Uint8Array(buf.slice(0, bytesRead)));
                   });
                 });
               });
             };
           } else {
-            getSize = () => currentFile.size;
+            const fileSize = currentFile.size || 0;
+            getSize = () => fileSize;
             readChunk = (chunkSize, offset) => {
               return new Promise((resolve, reject) => {
+                if (offset >= fileSize) {
+                  return resolve(new Uint8Array(0));
+                }
                 const reader = new FileReader();
                 reader.onload = (e) => {
                   if (e.target?.result instanceof ArrayBuffer) {
                     resolve(new Uint8Array(e.target.result));
                   } else {
-                    reject('Read error');
+                    resolve(new Uint8Array(0));
                   }
                 };
-                reader.onerror = reject;
-                reader.readAsArrayBuffer(currentFile.slice(offset, offset + chunkSize));
+                reader.onerror = () => resolve(new Uint8Array(0));
+                const end = Math.min(offset + chunkSize, fileSize);
+                reader.readAsArrayBuffer(currentFile.slice(offset, end));
               });
             };
           }
@@ -89,14 +103,19 @@ export const AboutModal = ({
             setMediaInfo(result);
             setAnalyzedFilePath(filePath);
           }
-          mediainfo.close();
         } catch (e: any) {
-          console.error("Failed to get mediainfo, likely file access error:", e);
+          console.warn("MediaInfo parsing safely skipped:", e?.message || e);
           if (isMounted) {
              setMediaInfo(null);
-             // Optionally set an error state here if needed
           }
         } finally {
+          if (mediainfo) {
+            try {
+              mediainfo.close();
+            } catch (closeErr) {
+              // ignore close error
+            }
+          }
           if (isMounted) setIsLoadingInfo(false);
         }
       };

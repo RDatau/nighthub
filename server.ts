@@ -5,6 +5,37 @@ import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality, LiveServerMessage } from "@google/genai";
 
+// Tangani uncaught exception dan unhandled rejection agar undici parser bug atau stream error tidak mematikan server
+process.on("uncaughtException", (err: any) => {
+  const msg = (err && (err.stack || err.message || String(err))) || "";
+  if (
+    msg.includes("assert(!this.paused)") ||
+    msg.includes("undici") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("EPIPE") ||
+    msg.includes("ETIMEDOUT") ||
+    msg.includes("ERR_STREAM_PREMATURE_CLOSE")
+  ) {
+    console.warn("[SERVER BACKGROUND NETWORK EXCEPTION SUPPRESSED]:", msg);
+    return;
+  }
+  console.error("[SERVER UNCAUGHT EXCEPTION]:", err);
+});
+
+process.on("unhandledRejection", (reason: any) => {
+  const msg = (reason && (reason.stack || reason.message || String(reason))) || "";
+  if (
+    msg.includes("assert(!this.paused)") ||
+    msg.includes("undici") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("EPIPE")
+  ) {
+    console.warn("[SERVER BACKGROUND REJECTION SUPPRESSED]:", msg);
+    return;
+  }
+  console.warn("[SERVER UNHANDLED REJECTION]:", reason);
+});
+
 // Safety settings untuk mengizinkan bahasa eksplisit/vulgar tanpa diblokir model
 export const safetySettings = [
   { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
@@ -170,10 +201,11 @@ export async function executeWithKeyRotation<T>(
         status === 503;
 
       if ((isQuotaError || isKeyInvalid || isConnectionError) && allKeys.length > 1 && attempt < totalAttempts - 1) {
-        console.warn(`[${opName}-Rotation] Key #${keyIndex + 1}/${allKeys.length} (${activeKey.slice(0, 4)}...${activeKey.slice(-4)}) terkena ${isQuotaError ? '429 Quota Exceeded' : isKeyInvalid ? 'Invalid/Permission Error' : 'Connection Error'}. Merotasi ke Key berikutnya (Percobaan ${attempt + 1}/${totalAttempts})...`);
+        const errorReason = isQuotaError ? '429 Quota Exceeded' : isKeyInvalid ? 'Invalid/Permission Error' : `Connection/Service Error (${status || 'Net'})`;
+        console.warn(`[${opName}-Rotation] Key #${keyIndex + 1}/${allKeys.length} (${activeKey.slice(0, 4)}...${activeKey.slice(-4)}) terkena ${errorReason}: "${error.message?.slice(0, 90) || error}". Merotasi ke Key berikutnya (Percobaan ${attempt + 1}/${totalAttempts})...`);
         markGeminiKeyExhausted(activeKey);
         rotateGeminiKey(allKeys);
-        const waitTime = isConnectionError ? 500 : 200;
+        const waitTime = isConnectionError ? 400 : 150;
         await new Promise((r) => setTimeout(r, waitTime));
         continue;
       }
@@ -275,6 +307,114 @@ export function buildTtsParts(text: string, modelName: string, styleInstruction?
   return [{ text: `${stylePrefix}Speak this text: "${cleanText}".` }];
 }
 
+// Helper function for speech generation with model fallback (gemini-3.8-flash-tts -> gemini-3.8-flash-lite-tts)
+export async function generateGeminiSpeech(
+  ai: GoogleGenAI,
+  requestedModel: string,
+  ttsParts: any[],
+  voiceName: string,
+  temperature: number = 1.0,
+  safety: any = safetySettings
+): Promise<{ audio: string; mimeType: string }> {
+  const modelsToTry = [requestedModel || "gemini-3.8-flash-tts"];
+  if (modelsToTry[0] !== "gemini-3.8-flash-lite-tts") {
+    modelsToTry.push("gemini-3.8-flash-lite-tts");
+  }
+
+  let lastErr: any = null;
+  for (const modelToUse of modelsToTry) {
+    const supportsStreaming = isTtsModelStreamSupported(modelToUse);
+    let audioBase64: string | null = null;
+    let mimeType: string = "audio/pcm";
+
+    if (supportsStreaming) {
+      try {
+        const stream = await ai.models.generateContentStream({
+          model: modelToUse,
+          contents: [{ parts: ttsParts }],
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName },
+              },
+            },
+            temperature: typeof temperature === 'number' ? temperature : 1.0,
+            safetySettings: safety as any,
+          },
+        });
+
+        const pcmChunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          const parts = chunk.candidates?.[0]?.content?.parts;
+          if (parts) {
+            for (const part of parts) {
+              if (part.inlineData?.data) {
+                pcmChunks.push(Buffer.from(part.inlineData.data, "base64"));
+                if (part.inlineData.mimeType) {
+                  mimeType = part.inlineData.mimeType;
+                }
+              }
+            }
+          }
+        }
+        if (pcmChunks.length > 0) {
+          audioBase64 = Buffer.concat(pcmChunks).toString("base64");
+        }
+      } catch (streamErr: any) {
+        console.warn(`[TTS-Stream] ${modelToUse} stream failed: ${streamErr?.message || streamErr}`);
+      }
+    }
+
+    if (!audioBase64) {
+      try {
+        const speechResponse = await ai.models.generateContent({
+          model: modelToUse,
+          contents: [{ parts: ttsParts }],
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName },
+              },
+            },
+            temperature: typeof temperature === 'number' ? temperature : 1.0,
+            safetySettings: safety as any,
+          },
+        });
+
+        const candidates = speechResponse.candidates || [];
+        for (const cand of candidates) {
+          const parts = cand.content?.parts || [];
+          for (const part of parts) {
+            if (part.inlineData?.data) {
+              audioBase64 = part.inlineData.data;
+              mimeType = part.inlineData.mimeType || mimeType;
+              break;
+            }
+          }
+          if (audioBase64) break;
+        }
+      } catch (genErr: any) {
+        lastErr = genErr;
+        const msg = (genErr?.message || "").toLowerCase();
+        // If quota 429 on flash-tts, try flash-lite-tts on the same key before giving up
+        if ((msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted")) && modelToUse !== "gemini-3.8-flash-lite-tts") {
+          console.warn(`[TTS] ${modelToUse} hit quota, fallback to gemini-3.8-flash-lite-tts...`);
+          continue;
+        }
+        throw genErr;
+      }
+    }
+
+    if (audioBase64) {
+      return { audio: audioBase64, mimeType };
+    }
+  }
+
+  throw lastErr || new Error("Gagal menghasilkan audio: Model tidak mengembalikan audio chunk.");
+}
+
 // API Endpoint for generating standalone TTS audio for specific text
 app.post("/api/ai/tts", async (req, res) => {
   try {
@@ -286,96 +426,18 @@ app.post("/api/ai/tts", async (req, res) => {
     const voiceName = voice || "Kore";
     const primaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : "gemini-3.8-flash-tts";
     const ttsParts = buildTtsParts(text, primaryModel, aiStyleInstruction);
-    const supportsStreaming = isTtsModelStreamSupported(primaryModel);
 
     const result = await executeWithKeyRotation(
       apiKey,
       async (ai, activeKey, keyIdx, totalKeys) => {
-        let audioBase64: string | null = null;
-        let mimeType: string = "audio/pcm";
-
-        // Jika model mendukung streaming, coba generateContentStream terlebih dahulu
-        if (supportsStreaming) {
-          try {
-            const stream = await ai.models.generateContentStream({
-              model: primaryModel,
-              contents: [{ parts: ttsParts }],
-              config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                  voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName },
-                  },
-                },
-                temperature: typeof temperature === 'number' ? temperature : 1.0,
-                safetySettings: safetySettings as any,
-              },
-            });
-
-            const pcmChunks: Buffer[] = [];
-            for await (const chunk of stream) {
-              const parts = chunk.candidates?.[0]?.content?.parts;
-              if (parts) {
-                for (const part of parts) {
-                  if (part.inlineData?.data) {
-                    pcmChunks.push(Buffer.from(part.inlineData.data, "base64"));
-                    if (part.inlineData.mimeType) {
-                      mimeType = part.inlineData.mimeType;
-                    }
-                  }
-                }
-              }
-            }
-
-            if (pcmChunks.length > 0) {
-              audioBase64 = Buffer.concat(pcmChunks).toString("base64");
-            }
-          } catch (streamErr: any) {
-            console.warn(`[TTS-Stream] Streaming dengan model ${primaryModel} gagal/tidak didukung, coba generateContent:`, streamErr?.message || streamErr);
-            const msg = (streamErr?.message || "").toLowerCase();
-            // Jika error 429 kuota habis, lempar error agar executeWithKeyRotation merotasi ke key berikutnya!
-            if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted") || msg.includes("403")) {
-              throw streamErr;
-            }
-          }
-        }
-
-        // Fallback ke generateContent utuh jika streaming tidak menghasilkan audio
-        if (!audioBase64) {
-          const speechResponse = await ai.models.generateContent({
-            model: primaryModel,
-            contents: [{ parts: ttsParts }],
-            config: {
-              responseModalities: [Modality.AUDIO],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName },
-                },
-              },
-              temperature: typeof temperature === 'number' ? temperature : 1.0,
-              safetySettings: safetySettings as any,
-            },
-          });
-
-          const candidates = speechResponse.candidates || [];
-          for (const cand of candidates) {
-            const parts = cand.content?.parts || [];
-            for (const part of parts) {
-              if (part.inlineData?.data) {
-                audioBase64 = part.inlineData.data;
-                mimeType = part.inlineData.mimeType || mimeType;
-                break;
-              }
-            }
-            if (audioBase64) break;
-          }
-        }
-
-        if (!audioBase64) {
-          throw new Error("Gagal menghasilkan audio: Model tidak mengembalikan audio chunk.");
-        }
-
-        return { audio: audioBase64, mimeType };
+        return await generateGeminiSpeech(
+          ai,
+          primaryModel,
+          ttsParts,
+          voiceName,
+          typeof temperature === 'number' ? temperature : 1.0,
+          safetySettings
+        );
       },
       { operationName: "TTS-Speech" }
     );
@@ -518,24 +580,40 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
         try {
           response = await ai.models.generateContent({
             model: targetModel,
-            contents: { parts: contentsParts },
+            contents: [{ parts: contentsParts }],
             config: genConfig,
           });
         } catch (genErr: any) {
           const msg = (genErr?.message || "").toLowerCase();
-          if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted") || msg.includes("403")) {
+          const errCode = genErr?.status || genErr?.code;
+          if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted") || msg.includes("403") || errCode === 429 || errCode === "RESOURCE_EXHAUSTED") {
             throw genErr; // Lempar agar executeWithKeyRotation merotasi ke key berikutnya!
           }
-          console.warn("Primary generateContent failed with config, retrying with clean fallback config:", genErr?.message || genErr);
-          response = await ai.models.generateContent({
-            model: targetModel,
-            contents: { parts: contentsParts },
-            config: {
-              systemInstruction,
-              temperature: typeof temperature === 'number' ? temperature : 0.85,
-              safetySettings: computedSafetySettings,
-            },
-          });
+          const candidateFallbacks = ["gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash"].filter(m => m !== targetModel);
+          let fallbackSuccess = false;
+          for (const fallbackModel of candidateFallbacks) {
+            try {
+              console.warn(`[Live-Comment] Model ${targetModel} gagal (${genErr?.message?.slice(0, 60)}), mencoba fallback model ${fallbackModel}...`);
+              response = await ai.models.generateContent({
+                model: fallbackModel,
+                contents: [{ parts: contentsParts }],
+                config: {
+                  systemInstruction,
+                  temperature: typeof temperature === 'number' ? temperature : 0.85,
+                  safetySettings: computedSafetySettings,
+                },
+              });
+              if (response && response.text) {
+                fallbackSuccess = true;
+                break;
+              }
+            } catch (fbErr: any) {
+              console.warn(`[Live-Comment] Fallback model ${fallbackModel} juga tidak merespons:`, fbErr?.message?.slice(0, 60));
+            }
+          }
+          if (!fallbackSuccess) {
+            throw genErr;
+          }
         }
         return response.text || "Saya tidak dapat menganalisis video saat ini.";
       },
@@ -552,74 +630,18 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
         const voiceName = voice || "Kore";
         const cleanReply = replyText.replace(/[*#_~`]/g, "").slice(0, 400).trim();
         const ttsParts = buildTtsParts(cleanReply, ttsPrimaryModel, aiStyleInstruction);
-        const supportsStreaming = isTtsModelStreamSupported(ttsPrimaryModel);
 
         const ttsResult = await executeWithKeyRotation(
           apiKey,
           async (ai, activeKey, keyIdx, totalKeys) => {
-            let chunkAudio: string | null = null;
-            let chunkMime = "audio/pcm";
-
-            if (supportsStreaming) {
-              try {
-                const stream = await ai.models.generateContentStream({
-                  model: ttsPrimaryModel,
-                  contents: [{ parts: ttsParts }],
-                  config: {
-                    responseModalities: [Modality.AUDIO],
-                    speechConfig: {
-                      voiceConfig: {
-                        prebuiltVoiceConfig: { voiceName },
-                      },
-                    },
-                    safetySettings: computedSafetySettings as any,
-                  },
-                });
-
-                const pcmChunks: Buffer[] = [];
-                for await (const chunk of stream) {
-                  const parts = chunk.candidates?.[0]?.content?.parts;
-                  if (parts) {
-                    for (const part of parts) {
-                      if (part.inlineData?.data) {
-                        pcmChunks.push(Buffer.from(part.inlineData.data, "base64"));
-                        if (part.inlineData.mimeType) chunkMime = part.inlineData.mimeType;
-                      }
-                    }
-                  }
-                }
-                if (pcmChunks.length > 0) {
-                  chunkAudio = Buffer.concat(pcmChunks).toString("base64");
-                }
-              } catch (stErr: any) {
-                const msg = (stErr?.message || "").toLowerCase();
-                if (msg.includes("429") || msg.includes("quota") || msg.includes("resource_exhausted") || msg.includes("403")) {
-                  throw stErr;
-                }
-              }
-            }
-
-            if (!chunkAudio) {
-              const speechResponse = await ai.models.generateContent({
-                model: ttsPrimaryModel,
-                contents: [{ parts: ttsParts }],
-                config: {
-                  responseModalities: [Modality.AUDIO],
-                  speechConfig: {
-                    voiceConfig: {
-                      prebuiltVoiceConfig: { voiceName },
-                    },
-                  },
-                  safetySettings: computedSafetySettings as any,
-                },
-              });
-              const part = speechResponse.candidates?.[0]?.content?.parts?.[0];
-              chunkAudio = part?.inlineData?.data || null;
-              chunkMime = part?.inlineData?.mimeType || chunkMime;
-            }
-
-            if (!chunkAudio) throw new Error("AUDIO_GEN_EMPTY");
-            return { audio: chunkAudio, mimeType: chunkMime };
+            return await generateGeminiSpeech(
+              ai,
+              ttsPrimaryModel,
+              ttsParts,
+              voiceName,
+              typeof temperature === 'number' ? temperature : 1.0,
+              computedSafetySettings
+            );
           },
           { operationName: "Live-Comment-TTS" }
         );
@@ -627,7 +649,7 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
         audioBase64 = ttsResult.audio;
         mimeType = ttsResult.mimeType;
       } catch (voiceErr: any) {
-        console.warn("Live-Comment speech generation failed across key pool:", voiceErr?.message || voiceErr);
+        console.warn("Live-Comment speech generation fallback across key pool:", voiceErr?.message || voiceErr);
       }
     }
 

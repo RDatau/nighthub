@@ -536,9 +536,9 @@ export const usePlayer = (videoRef: React.RefObject<HTMLVideoElement | null>, in
     if (!videoEl) return;
 
     const handleReadyToPlay = () => {
-      if (isPlaying && videoEl.paused && videoEl.src) {
+      if (isPlaying && videoEl.paused && videoEl.src && videoSrc) {
         videoEl.play().catch(e => {
-          if (e.name !== 'AbortError') {
+          if (e.name !== 'AbortError' && e.name !== 'NotSupportedError') {
             console.warn("Auto-play on ready failed:", e);
           }
         });
@@ -552,7 +552,7 @@ export const usePlayer = (videoRef: React.RefObject<HTMLVideoElement | null>, in
       videoEl.removeEventListener('canplay', handleReadyToPlay);
       videoEl.removeEventListener('loadedmetadata', handleReadyToPlay);
     };
-  }, [isPlaying, videoRef]);
+  }, [isPlaying, videoRef, videoSrc]);
 
   // Force sound on source change
   useEffect(() => {
@@ -563,13 +563,16 @@ export const usePlayer = (videoRef: React.RefObject<HTMLVideoElement | null>, in
       
       // Attempt to resume audio context on source change too
       if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
-        audioCtxRef.current.resume().catch(console.error);
+        audioCtxRef.current.resume().catch(console.warn);
       }
     }
   }, [videoSrc, isMuted, volume]);
 
   useEffect(() => {
     if (videoRef.current) {
+      if (!videoSrc) {
+        return;
+      }
       if (isPlaying) {
         // Force sync volume and mute state before playing
         videoRef.current.muted = isMuted;
@@ -583,10 +586,10 @@ export const usePlayer = (videoRef: React.RefObject<HTMLVideoElement | null>, in
         const playPromise = videoRef.current.play();
         if (playPromise !== undefined) {
           playPromise.catch(e => {
-            if (e.name !== 'AbortError') {
+            if (e.name !== 'AbortError' && e.name !== 'NotSupportedError') {
               console.warn("Autoplay blocked or failed, retrying muted...", e);
               // If blocked, sometimes playing muted first then unmuting works
-              if (videoRef.current) {
+              if (videoRef.current && videoSrc) {
                 videoRef.current.muted = true;
                 videoRef.current.play().then(() => {
                   // After successful muted play, try to unmute after a short delay
@@ -598,20 +601,19 @@ export const usePlayer = (videoRef: React.RefObject<HTMLVideoElement | null>, in
                         initAudioContext();
                       }
                       if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
-                        audioCtxRef.current.resume().catch(console.error);
+                        audioCtxRef.current.resume().catch(console.warn);
                       }
                     }
                   }, 100);
-                }).catch(console.error);
+                }).catch(console.warn);
               }
-              // Don't set isPlaying to false immediately, let the muted play attempt happen
             }
           });
         }
         
         // Aggressive resume for AudioContext
         if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
-          audioCtxRef.current.resume().catch(console.error);
+          audioCtxRef.current.resume().catch(console.warn);
         }
       } else {
         videoRef.current.pause();

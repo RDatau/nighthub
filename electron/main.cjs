@@ -3,6 +3,41 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+// --- GLOBAL UNCAUGHT EXCEPTION & REJECTION HANDLERS ---
+// Prevents Undici TLS socket parser bugs (e.g. assert(!this.paused)), connection resets,
+// and background streaming drops from popping up fatal dialogs in Electron main process.
+process.on('uncaughtException', (err) => {
+  const errStr = (err && (err.stack || err.message || String(err))) || '';
+  if (
+    errStr.includes('assert(!this.paused)') ||
+    errStr.includes('undici') ||
+    errStr.includes('ECONNRESET') ||
+    errStr.includes('EPIPE') ||
+    errStr.includes('ETIMEDOUT') ||
+    errStr.includes('ERR_STREAM_PREMATURE_CLOSE') ||
+    errStr.includes('Socket closed')
+  ) {
+    console.warn('[ELECTRON BACKGROUND NETWORK EXCEPTION SUPPRESSED]:', errStr);
+    return;
+  }
+  console.error('[ELECTRON UNCAUGHT EXCEPTION]:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const reasonStr = (reason && (reason.stack || reason.message || String(reason))) || '';
+  if (
+    reasonStr.includes('assert(!this.paused)') ||
+    reasonStr.includes('undici') ||
+    reasonStr.includes('ECONNRESET') ||
+    reasonStr.includes('EPIPE') ||
+    reasonStr.includes('ETIMEDOUT')
+  ) {
+    console.warn('[ELECTRON BACKGROUND REJECTION SUPPRESSED]:', reasonStr);
+    return;
+  }
+  console.warn('[ELECTRON UNHANDLED REJECTION]:', reason);
+});
+
 // --- UTILITY PROCESS FOR BACKGROUND TASKS ---
 let backgroundWorker = null;
 
@@ -379,35 +414,140 @@ const aiSafetySettings = [
   { category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' },
 ];
 
-let electronDefaultAiClient = null;
+function parseGeminiApiKeys(input) {
+  const keys = [];
+  if (input && typeof input === 'string') {
+    const parsed = input
+      .split(/[\r\n,;\s]+/)
+      .map(k => k.trim()
+        .replace(/^(?:GEMINI_API_KEY|API_KEY|KEY)\s*[:=]\s*/i, '')
+        .replace(/^["']|["']$/g, '')
+        .trim()
+      )
+      .filter(k => k.length > 10);
+    keys.push(...parsed);
+  }
+  if (process.env.GEMINI_API_KEY) {
+    const envKeys = process.env.GEMINI_API_KEY
+      .split(/[\r\n,;\s]+/)
+      .map(k => k.trim().replace(/^["']|["']$/g, '').trim())
+      .filter(k => k.length > 10);
+    keys.push(...envKeys);
+  }
+  const uniqueKeys = [];
+  for (const k of keys) {
+    if (!uniqueKeys.includes(k)) {
+      uniqueKeys.push(k);
+    }
+  }
+  return uniqueKeys;
+}
+
+let currentGeminiKeyIndex = 0;
+const exhaustedGeminiKeysMap = new Map();
+const GEMINI_KEY_COOLDOWN_MS = 60 * 1000;
+
+function markGeminiKeyExhausted(key) {
+  if (key) {
+    exhaustedGeminiKeysMap.set(key, Date.now());
+  }
+}
+
+function getNextAvailableGeminiKey(keys) {
+  if (!keys || keys.length === 0) return null;
+  const now = Date.now();
+  for (const [key, timestamp] of exhaustedGeminiKeysMap.entries()) {
+    if (now - timestamp > GEMINI_KEY_COOLDOWN_MS) {
+      exhaustedGeminiKeysMap.delete(key);
+    }
+  }
+  for (let i = 0; i < keys.length; i++) {
+    const idx = (currentGeminiKeyIndex + i) % keys.length;
+    const candidate = keys[idx];
+    if (!exhaustedGeminiKeysMap.has(candidate)) {
+      currentGeminiKeyIndex = idx;
+      return { key: candidate, index: idx };
+    }
+  }
+  let oldestKey = keys[currentGeminiKeyIndex % keys.length];
+  let oldestTime = Infinity;
+  for (let i = 0; i < keys.length; i++) {
+    const candidate = keys[i];
+    const time = exhaustedGeminiKeysMap.get(candidate) || 0;
+    if (time < oldestTime) {
+      oldestTime = time;
+      oldestKey = candidate;
+      currentGeminiKeyIndex = i;
+    }
+  }
+  return { key: oldestKey, index: currentGeminiKeyIndex };
+}
+
+function rotateGeminiKey(keys) {
+  if (!keys || keys.length === 0) return null;
+  currentGeminiKeyIndex = (currentGeminiKeyIndex + 1) % keys.length;
+  return keys[currentGeminiKeyIndex];
+}
+
+async function executeWithKeyRotation(customKeyInput, operation, options = {}) {
+  const allKeys = parseGeminiApiKeys(customKeyInput);
+  if (allKeys.length === 0) {
+    throw new Error("Tidak ada Gemini API Key yang valid ditemukan.");
+  }
+  const opName = options.operationName || "Gemini-Operation";
+  const totalAttempts = allKeys.length > 1 ? allKeys.length : (options.maxRetries ?? 2) + 1;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    const keyObj = getNextAvailableGeminiKey(allKeys);
+    const activeKey = keyObj?.key || allKeys[0];
+    const keyIndex = keyObj?.index ?? 0;
+
+    const ai = new GoogleGenAI({
+      apiKey: activeKey,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+
+    try {
+      return await operation(ai, activeKey, keyIndex, allKeys.length);
+    } catch (error) {
+      lastError = error;
+      const errorMsg = (error.message || "").toLowerCase();
+      const status = error.status || error.code;
+      const isQuotaError = errorMsg.includes("429") || errorMsg.includes("resource_exhausted") || errorMsg.includes("quota") || status === "RESOURCE_EXHAUSTED" || status === 429;
+      const isKeyInvalid = errorMsg.includes("api_key_invalid") || errorMsg.includes("not valid") || status === 403;
+      const isConnectionError = errorMsg.includes("fetch failed") || errorMsg.includes("network") || errorMsg.includes("econnreset") || status === 500 || status === 503;
+
+      if ((isQuotaError || isKeyInvalid || isConnectionError) && allKeys.length > 1 && attempt < totalAttempts - 1) {
+        markGeminiKeyExhausted(activeKey);
+        rotateGeminiKey(allKeys);
+        await new Promise((r) => setTimeout(r, 200));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError;
+}
 
 function getElectronGenAI(customKey) {
-  if (customKey && customKey.trim()) {
-    return new GoogleGenAI({
-      apiKey: customKey.trim(),
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
+  const keys = parseGeminiApiKeys(customKey);
+  const keyToUse = keys[0] || process.env.GEMINI_API_KEY || '';
+  if (!keyToUse) {
+    throw new Error('GEMINI_API_KEY environment variable is missing and no custom key was provided.');
   }
-
-  if (!electronDefaultAiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('GEMINI_API_KEY environment variable is missing and no custom key was provided.');
-    }
-    electronDefaultAiClient = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
+  return new GoogleGenAI({
+    apiKey: keyToUse,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
       },
-    });
-  }
-  return electronDefaultAiClient;
+    },
+  });
 }
 
 const aiApiApp = express();
@@ -717,6 +857,144 @@ aiApiServer.on('error', (err) => {
 
 aiApiServer.listen(3000, '0.0.0.0', () => {
   console.log('[AI API SERVER] Local AI API server listening on http://127.0.0.1:3000');
+});
+
+const { WebSocketServer, WebSocket } = require('ws');
+const wss = new WebSocketServer({ server: aiApiServer, path: '/api/gemini-live' });
+
+wss.on('connection', (clientWs) => {
+  console.log('[WebSocket] Client connected to Gemini Live API route in Electron');
+  let sessionPromise = null;
+  let session = null;
+
+  clientWs.on('message', async (rawMessage) => {
+    try {
+      const msg = JSON.parse(rawMessage.toString());
+
+      if (msg.type === 'init') {
+        const {
+          apiKey,
+          voice = 'Kore',
+          systemInstruction = 'You are an AI companion.',
+          model = 'gemini-3.1-flash-live-preview',
+        } = msg;
+
+        const targetModel = (model && model.includes('gemini')) ? model : 'gemini-3.1-flash-live-preview';
+        const allKeys = parseGeminiApiKeys(apiKey);
+        let connected = false;
+        const maxAttempts = Math.min(allKeys.length, 5);
+
+        for (let attempt = 0; attempt < Math.max(maxAttempts, 1); attempt++) {
+          const keyObj = getNextAvailableGeminiKey(allKeys);
+          const activeKey = keyObj?.key || allKeys[0] || process.env.GEMINI_API_KEY || '';
+
+          try {
+            const ai = new GoogleGenAI({
+              apiKey: activeKey,
+              httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+            });
+
+            sessionPromise = ai.live.connect({
+              model: targetModel,
+              config: {
+                responseModalities: [Modality.AUDIO],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: voice || 'Kore' },
+                  },
+                },
+                systemInstruction: systemInstruction || 'You are a helpful AI companion.',
+              },
+              callbacks: {
+                onmessage: (message) => {
+                  if (clientWs.readyState !== WebSocket.OPEN) return;
+                  const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                  if (audioData) {
+                    clientWs.send(JSON.stringify({ type: 'audio', data: audioData }));
+                  }
+                  const textPart = message.serverContent?.modelTurn?.parts?.find((p) => p.text)?.text;
+                  const outputText = message.serverContent?.outputTranscription?.text || textPart;
+                  if (outputText) {
+                    clientWs.send(JSON.stringify({ type: 'model_transcript', text: outputText }));
+                  }
+                  const inputText = message.serverContent?.inputTranscription?.text;
+                  if (inputText) {
+                    clientWs.send(JSON.stringify({ type: 'user_transcript', text: inputText }));
+                  }
+                  if (message.serverContent?.turnComplete) {
+                    clientWs.send(JSON.stringify({ type: 'turn_complete' }));
+                  }
+                  if (message.serverContent?.interrupted) {
+                    clientWs.send(JSON.stringify({ type: 'interrupted' }));
+                  }
+                },
+                onerror: (err) => {
+                  console.error('[Gemini Live API] Session error in Electron:', err);
+                  const errMsg = (err?.message || '').toLowerCase();
+                  if (errMsg.includes('429') || errMsg.includes('quota')) {
+                    markGeminiKeyExhausted(activeKey);
+                    rotateGeminiKey(allKeys);
+                  }
+                  if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify({ type: 'error', error: err?.message || 'Live session error' }));
+                  }
+                },
+                onclose: () => {
+                  if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify({ type: 'closed' }));
+                  }
+                },
+              },
+            });
+
+            session = await sessionPromise;
+            connected = true;
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ type: 'connected' }));
+            }
+            break;
+          } catch (initErr) {
+            const errMsg = (initErr?.message || '').toLowerCase();
+            if ((errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('resource_exhausted')) && allKeys.length > 1) {
+              markGeminiKeyExhausted(activeKey);
+              rotateGeminiKey(allKeys);
+              continue;
+            }
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(JSON.stringify({ type: 'error', error: initErr?.message || 'Gagal menghubungkan ke Gemini Live API.' }));
+            }
+            break;
+          }
+        }
+      } else if (sessionPromise) {
+        const activeSession = session || (await sessionPromise.catch(() => null));
+        if (activeSession) {
+          if (msg.type === 'audio' && msg.data) {
+            activeSession.sendRealtimeInput({
+              audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
+            });
+          } else if (msg.type === 'image' && msg.data) {
+            activeSession.sendRealtimeInput({
+              video: { data: msg.data, mimeType: msg.mimeType || 'image/jpeg' },
+            });
+          } else if (msg.type === 'text' && msg.text) {
+            try {
+              await activeSession.sendRealtimeInput({ text: msg.text });
+            } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {}
+  });
+
+  clientWs.on('close', async () => {
+    if (sessionPromise) {
+      try {
+        const activeSession = session || (await sessionPromise.catch(() => null));
+        if (activeSession) activeSession.close();
+      } catch (_) {}
+    }
+  });
 });
 
 // Stream local files over HTTP to bypass file:// browser security restrictions in Electron
@@ -1086,8 +1364,8 @@ ipcMain.handle('resolve-youtube', async (event, url) => {
   } catch (err) {
     logStream(`[RESOLVE YOUTUBE ERROR] yt-dlp failed: ${err.message}. Falling back to Cobalt...`);
     try {
-      const fetch = require('cross-fetch');
-      const res = await fetch('https://api.cobalt.tools/api/json', {
+      const fetchClient = (net && typeof net.fetch === 'function') ? net.fetch : require('cross-fetch');
+      const res = await fetchClient('https://api.cobalt.tools/api/json', {
         method: 'POST',
         headers: {
           'Accept': 'application/json',
@@ -1829,10 +2107,10 @@ function getDownloadDialogOptions(fileName, mimeType, lang = 'id', url = '', isI
 }
 
 // Inisialisasi Ghostery AdBlocker
-const customFetch = (url, options) => {
+const customFetch = async (url, options = {}) => {
   if (url === 'custom:whitelist') {
-    return Promise.resolve({
-      text: () => Promise.resolve(`
+    return {
+      text: async () => `
 ! === WHITELIST ===
 @@||challenges.cloudflare.com^
 @@||turnstile.cloudflare.com^
@@ -1860,11 +2138,36 @@ const customFetch = (url, options) => {
 ! Blokir network e-commerce jika dipanggil sebagai script/iframe tersembunyi
 ||shopee.co.id^$subdocument,third-party
 ||tokopedia.com^$subdocument,third-party
-`),
-      ok: true
-    });
+`,
+      ok: true,
+      status: 200
+    };
   }
-  return fetch(url, options);
+
+  // Gunakan Chromium net.fetch bawaan Electron (menghindari bug assert(!this.paused) undici di Node.js)
+  try {
+    if (app.isReady() && net && typeof net.fetch === 'function') {
+      const resp = await net.fetch(url, {
+        ...options,
+        redirect: 'follow'
+      });
+      return resp;
+    }
+  } catch (netErr) {
+    logStream(`[customFetch net.fetch error for ${url}]: ${netErr.message}`);
+  }
+
+  // Fallback aman jika net.fetch belum ready atau mengalami error
+  try {
+    return await fetch(url, options);
+  } catch (err) {
+    logStream(`[customFetch fallback error for ${url}]: ${err.message}`);
+    return {
+      text: async () => '',
+      ok: false,
+      status: 500
+    };
+  }
 };
 
 const adblockEnginePath = path.join(app.getPath('userData'), 'adblocker-engine.bin');
@@ -5411,8 +5714,8 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
       } catch (ytDlpErr) {
         logStream(`[YOUTUBE DOWNLOAD YT-DLP FAILED] yt-dlp failed: ${ytDlpErr.message}. Falling back to Cobalt...`);
         try {
-          const fetch = require('cross-fetch');
-          const res = await fetch('https://api.cobalt.tools/api/json', {
+          const fetchClient = (net && typeof net.fetch === 'function') ? net.fetch : require('cross-fetch');
+          const res = await fetchClient('https://api.cobalt.tools/api/json', {
             method: 'POST',
             headers: {
               'Accept': 'application/json',

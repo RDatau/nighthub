@@ -464,14 +464,25 @@ export function AILiveCompanionModal({
       isQuotaErrorRef.current = false;
 
       try {
-        const rawKey = geminiApiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_api_key') : '') || '';
-        const cleanedKeys = rawKey
-          .split(/[\r\n,;\s]+/)
-          .map(k => k.trim().replace(/^(?:GEMINI_API_KEY|API_KEY|KEY)\s*[:=]\s*/i, '').replace(/^["']|["']$/g, '').trim())
-          .filter(k => k.length > 10);
+        const rawKeyInput = geminiApiKey || (typeof localStorage !== 'undefined' ? (localStorage.getItem('gemini_api_key') || localStorage.getItem('lumina_gemini_api_key')) : '') || '';
+        const parseKeys = (input?: string | string[]): string[] => {
+          if (!input) return [];
+          const str = Array.isArray(input) ? input.join(',') : String(input);
+          return str
+            .split(/[\r\n,;\s]+/)
+            .map(k => k.trim()
+              .replace(/^(?:GEMINI_API_KEY|API_KEY|KEY)\s*[:=]\s*/i, '')
+              .replace(/^["']|["']$/g, '')
+              .trim()
+            )
+            .filter(k => k.length > 10);
+        };
+        const cleanedKeys = parseKeys(rawKeyInput);
         
         const currentKeyIdx = liveKeyIndexRef.current % Math.max(cleanedKeys.length, 1);
-        const keyToUse = cleanedKeys.length > 0 ? cleanedKeys[currentKeyIdx] : rawKey.trim().replace(/[\r\n]+/g, '');
+        const keyToUse = cleanedKeys.length > 0 
+          ? cleanedKeys[currentKeyIdx] 
+          : (typeof rawKeyInput === 'string' ? rawKeyInput.split(/[\s\r\n]+/)[0]?.trim() || '' : '');
         console.log(`[Gemini-Live] Connecting with Key #${currentKeyIdx + 1}/${cleanedKeys.length || 1} (${keyToUse.slice(0, 4)}...${keyToUse.slice(-4)})`);
 
         const ai = new GoogleGenAI({
@@ -505,7 +516,7 @@ export function AILiveCompanionModal({
         const speechStyleText = aiStyleInstruction && aiStyleInstruction.trim()
           ? `[PETUNJUK TONE & GAYA BICARA SUARA WAJIB]: ${aiStyleInstruction.trim()}`
           : '';
-        const fullInstruction = `${personaText}
+        const fullInstruction = `${speechStyleText}
 ${styleText}
 ${speechStyleText ? speechStyleText + '\n' : ''}
 Informasi Context Video:
@@ -523,6 +534,232 @@ Instruksi Perilaku Live Call:
           ? aiLiveModel
           : 'gemini-3.1-flash-live-preview';
 
+        const handleMessageCallback = async (message: LiveServerMessage) => {
+          if (!isMounted) return;
+
+          if (message.serverContent?.outputTranscription) {
+            const text = message.serverContent.outputTranscription.text;
+            currentAgentTurnRef.current += text;
+            
+            const parsed = parseAgentText(currentAgentTurnRef.current);
+            setAgentReasoningText(parsed.reasoning);
+            setAgentSpeechText(parsed.speech);
+            
+            if (currentUserTurnRef.current.trim()) {
+              callTranscriptRef.current += `\nKamu: ${currentUserTurnRef.current.trim()}`;
+              currentUserTurnRef.current = "";
+              setTranscription("");
+            }
+          }
+          if (message.serverContent?.inputTranscription) {
+            const cleanedAgentText = parseAgentText(currentAgentTurnRef.current).speech;
+            if (cleanedAgentText.trim()) {
+              callTranscriptRef.current += `\nAgen: ${cleanedAgentText.trim()}`;
+              currentAgentTurnRef.current = "";
+            }
+            const text = message.serverContent.inputTranscription.text;
+            currentUserTurnRef.current += (currentUserTurnRef.current ? " " : "") + text;
+            setTranscription(currentUserTurnRef.current.trim());
+            lastActivityRef.current = Date.now();
+          }
+
+          const parts = message.serverContent?.modelTurn?.parts || [];
+          for (const part of parts) {
+            if (part.text) {
+              currentAgentTurnRef.current += part.text;
+              const parsed = parseAgentText(currentAgentTurnRef.current);
+              setAgentReasoningText(parsed.reasoning);
+              setAgentSpeechText(parsed.speech);
+            }
+            if (part.inlineData?.data) {
+              lastActivityRef.current = Date.now();
+              setLiveStatus('SPEAKING...');
+              setIsSpeaking(true);
+              setIsFinishingSpeech(false);
+
+              const base64Audio = part.inlineData.data;
+              const ctx = audioContextRef.current!;
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+
+              try {
+                const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
+                const source = ctx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(gainNodeRef.current || ctx.destination);
+                source.addEventListener('ended', () => {
+                  sourcesRef.current.delete(source);
+                  if (sourcesRef.current.size === 0) {
+                    setLiveStatus('LISTENING...');
+                    setIsSpeaking(false);
+                    setIsFinishingSpeech(true);
+                    setTimeout(() => setIsFinishingSpeech(false), 1500);
+                    setTimeout(() => { if (sourcesRef.current.size === 0) setAgentSpeechText(''); }, 2000);
+                  }
+                });
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += audioBuffer.duration;
+                sourcesRef.current.add(source);
+              } catch (e) {
+                console.error('Realtime audio decode error:', e);
+              }
+            }
+          }
+
+          if (message.serverContent?.interrupted) {
+            sourcesRef.current.forEach((s) => { try { s.stop(); } catch (e) {} });
+            sourcesRef.current.clear();
+            nextStartTimeRef.current = 0;
+
+            const toCommit = parseAgentText(currentAgentTurnRef.current).speech;
+            if (toCommit) {
+              callTranscriptRef.current += `\nAgen: ${toCommit} [DIPOTONG]`;
+            }
+
+            setAgentReasoningText('');
+            setAgentSpeechText('');
+            currentAgentTurnRef.current = "";
+            setAgentActivity(0);
+            setIsFinishingSpeech(false);
+            setIsSpeaking(false);
+          }
+
+          if (message.serverContent?.turnComplete) {
+            setLiveStatus('LISTENING...');
+            const toCommit = parseAgentText(currentAgentTurnRef.current).speech;
+            if (toCommit && !callTranscriptRef.current.endsWith(toCommit)) {
+              callTranscriptRef.current += `\nAgen: ${toCommit}`;
+            }
+            currentAgentTurnRef.current = "";
+            setTranscription('');
+            currentUserTurnRef.current = "";
+          }
+        };
+
+        const handleOpenCallback = () => {
+          if (!isMounted) return;
+          setLiveStatus('LISTENING...');
+
+          const source = inputAudioContextRef.current!.createMediaStreamSource(stream);
+          const scriptProcessor = inputAudioContextRef.current!.createScriptProcessor(4096, 1, 1);
+          scriptProcessor.onaudioprocess = (e) => {
+            if (isMutedRef.current || !isMounted || !sessionRef.current) return;
+            const inputData = e.inputBuffer.getChannelData(0);
+            const pcmBlob = createBlob(inputData, inputSampleRate);
+            sessionRef.current.sendRealtimeInput({ audio: pcmBlob });
+          };
+          source.connect(scriptProcessor);
+          scriptProcessor.connect(inputAudioContextRef.current!.destination);
+
+          setTimeout(() => {
+            if (sessionRef.current) {
+              sessionRef.current.sendRealtimeInput({
+                text: 'URGENT_POKE_GREETING: Sapa aku duluan sekarang dalam 1 kalimat singkat!'
+              });
+            }
+          }, 500);
+        };
+
+        let connectedViaWs = false;
+        try {
+          const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          const host = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || !window.location.hostname)
+            ? '127.0.0.1:3000'
+            : window.location.host;
+          const wsUrl = `${protocol}//${host}/api/gemini-live`;
+          const ws = new WebSocket(wsUrl);
+
+          await new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              ws.close();
+              reject(new Error('WS proxy timeout'));
+            }, 4000);
+
+            ws.onopen = () => {
+              ws.send(JSON.stringify({
+                type: 'init',
+                apiKey: keyToUse,
+                voice: currentVoice,
+                systemInstruction: fullInstruction,
+                model: targetLiveModel
+              }));
+            };
+
+            ws.onmessage = async (event) => {
+              try {
+                const data = JSON.parse(event.data);
+                if (data.type === 'connected') {
+                  clearTimeout(timeout);
+                  connectedViaWs = true;
+                  resolve(ws);
+                } else if (data.type === 'audio' && data.data) {
+                  await handleMessageCallback({
+                    serverContent: {
+                      modelTurn: {
+                        parts: [{ inlineData: { data: data.data, mimeType: 'audio/pcm' } }]
+                      }
+                    }
+                  } as any);
+                } else if (data.type === 'model_transcript' && data.text) {
+                  await handleMessageCallback({
+                    serverContent: {
+                      outputTranscription: { text: data.text }
+                    }
+                  } as any);
+                } else if (data.type === 'user_transcript' && data.text) {
+                  await handleMessageCallback({
+                    serverContent: {
+                      inputTranscription: { text: data.text }
+                    }
+                  } as any);
+                } else if (data.type === 'turn_complete') {
+                  await handleMessageCallback({
+                    serverContent: { turnComplete: true }
+                  } as any);
+                } else if (data.type === 'interrupted') {
+                  await handleMessageCallback({
+                    serverContent: { interrupted: true }
+                  } as any);
+                } else if (data.type === 'error') {
+                  if (!connectedViaWs) reject(new Error(data.error));
+                }
+              } catch (e) {}
+            };
+
+            ws.onerror = (err) => {
+              clearTimeout(timeout);
+              if (!connectedViaWs) reject(err);
+            };
+
+            ws.onclose = () => {
+              if (isMounted) {
+                setLiveStatus('OFFLINE');
+                setTimeout(() => {
+                  if (isMounted) setReconnectTrigger(prev => prev + 1);
+                }, 2000);
+              }
+            };
+          });
+
+          const wsSession = {
+            sendRealtimeInput: (input: { audio?: { data: string; mimeType: string }; text?: string; video?: { data: string; mimeType: string } }) => {
+              if (ws.readyState === WebSocket.OPEN) {
+                if (input.audio) ws.send(JSON.stringify({ type: 'audio', data: input.audio.data }));
+                if (input.text) ws.send(JSON.stringify({ type: 'text', text: input.text }));
+                if (input.video) ws.send(JSON.stringify({ type: 'image', data: input.video.data, mimeType: input.video.mimeType }));
+              }
+            },
+            close: () => {
+              try { ws.close(); } catch (e) {}
+            }
+          };
+
+          sessionRef.current = wsSession;
+          handleOpenCallback();
+          return;
+        } catch (wsErr) {
+          console.warn('[Gemini-Live] Local WebSocket proxy failed, falling back to direct ai.live.connect:', wsErr);
+        }
+
         const session = await ai.live.connect({
           model: targetLiveModel,
           config: {
@@ -532,142 +769,19 @@ Instruksi Perilaku Live Call:
             safetySettings: safetySettings as any,
           } as any,
           callbacks: {
-            onopen: () => {
-              if (!isMounted) return;
-              setLiveStatus('LISTENING...');
-
-              // Stream mic audio directly to Session
-              const source = inputAudioContextRef.current!.createMediaStreamSource(stream);
-              const scriptProcessor = inputAudioContextRef.current!.createScriptProcessor(4096, 1, 1);
-              scriptProcessor.onaudioprocess = (e) => {
-                if (isMutedRef.current || !isMounted || !sessionRef.current) return;
-                const inputData = e.inputBuffer.getChannelData(0);
-                const pcmBlob = createBlob(inputData, inputSampleRate);
-                sessionRef.current.sendRealtimeInput({ audio: pcmBlob });
-              };
-              source.connect(scriptProcessor);
-              scriptProcessor.connect(inputAudioContextRef.current!.destination);
-
-              // Poke greeting
-              setTimeout(() => {
-                if (sessionRef.current) {
-                  sessionRef.current.sendRealtimeInput({
-                    text: 'URGENT_POKE_GREETING: Sapa aku duluan sekarang dalam 1 kalimat singkat!'
-                  });
-                }
-              }, 500);
-            },
-            onmessage: async (message: LiveServerMessage) => {
-              if (!isMounted) return;
-
-              if (message.serverContent?.outputTranscription) {
-                const text = message.serverContent.outputTranscription.text;
-                currentAgentTurnRef.current += text;
-                
-                const parsed = parseAgentText(currentAgentTurnRef.current);
-                setAgentReasoningText(parsed.reasoning);
-                setAgentSpeechText(parsed.speech);
-                
-                if (currentUserTurnRef.current.trim()) {
-                  callTranscriptRef.current += `\nKamu: ${currentUserTurnRef.current.trim()}`;
-                  currentUserTurnRef.current = "";
-                  setTranscription("");
-                }
-              }
-              if (message.serverContent?.inputTranscription) {
-                const cleanedAgentText = parseAgentText(currentAgentTurnRef.current).speech;
-                if (cleanedAgentText.trim()) {
-                  callTranscriptRef.current += `\nAgen: ${cleanedAgentText.trim()}`;
-                  currentAgentTurnRef.current = "";
-                }
-                const text = message.serverContent.inputTranscription.text;
-                currentUserTurnRef.current += (currentUserTurnRef.current ? " " : "") + text;
-                setTranscription(currentUserTurnRef.current.trim());
-                lastActivityRef.current = Date.now();
-              }
-
-              const parts = message.serverContent?.modelTurn?.parts || [];
-              for (const part of parts) {
-                if (part.text) {
-                  currentAgentTurnRef.current += part.text;
-                  const parsed = parseAgentText(currentAgentTurnRef.current);
-                  setAgentReasoningText(parsed.reasoning);
-                  setAgentSpeechText(parsed.speech);
-                }
-                if (part.inlineData?.data) {
-                  lastActivityRef.current = Date.now();
-                  setLiveStatus('SPEAKING...');
-                  setIsSpeaking(true);
-                  setIsFinishingSpeech(false);
-
-                  const base64Audio = part.inlineData.data;
-                  const ctx = audioContextRef.current!;
-                  nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-
-                  try {
-                    const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
-                    const source = ctx.createBufferSource();
-                    source.buffer = audioBuffer;
-                    source.connect(gainNodeRef.current || ctx.destination);
-                    source.addEventListener('ended', () => {
-                      sourcesRef.current.delete(source);
-                      if (sourcesRef.current.size === 0) {
-                        setLiveStatus('LISTENING...');
-                        setIsSpeaking(false);
-                        setIsFinishingSpeech(true);
-                        setTimeout(() => setIsFinishingSpeech(false), 1500);
-                        setTimeout(() => { if (sourcesRef.current.size === 0) setAgentSpeechText(''); }, 2000);
-                      }
-                    });
-                    source.start(nextStartTimeRef.current);
-                    nextStartTimeRef.current += audioBuffer.duration;
-                    sourcesRef.current.add(source);
-                  } catch (e) {
-                    console.error('Realtime audio decode error:', e);
-                  }
-                }
-              }
-
-              if (message.serverContent?.interrupted) {
-                sourcesRef.current.forEach((s) => { try { s.stop(); } catch (e) {} });
-                sourcesRef.current.clear();
-                nextStartTimeRef.current = 0;
-
-                const toCommit = parseAgentText(currentAgentTurnRef.current).speech;
-                if (toCommit) {
-                  callTranscriptRef.current += `\nAgen: ${toCommit} [DIPOTONG]`;
-                }
-
-                setAgentReasoningText('');
-                setAgentSpeechText('');
-                currentAgentTurnRef.current = "";
-                setAgentActivity(0);
-                setIsFinishingSpeech(false);
-                setIsSpeaking(false);
-              }
-
-              if (message.serverContent?.turnComplete) {
-                setLiveStatus('LISTENING...');
-                const toCommit = parseAgentText(currentAgentTurnRef.current).speech;
-                if (toCommit && !callTranscriptRef.current.endsWith(toCommit)) {
-                  callTranscriptRef.current += `\nAgen: ${toCommit}`;
-                }
-                currentAgentTurnRef.current = "";
-                setTranscription('');
-                currentUserTurnRef.current = "";
-              }
-            },
+            onopen: handleOpenCallback,
+            onmessage: handleMessageCallback,
             onerror: (e: any) => {
               console.error('Gemini Live session error:', e);
               if (isMounted) {
                 const msg = (e.message || '').toLowerCase();
                 const isQuota = msg.includes('429') || msg.includes('quota') || msg.includes('resource_exhausted');
+                const isNetwork = msg.includes('network') || msg.includes('fetch') || msg.includes('socket') || msg.includes('timeout') || msg.includes('econnreset');
                 
-                if (isQuota && cleanedKeys.length > 1) {
+                if ((isQuota || isNetwork) && cleanedKeys.length > 1) {
                   liveKeyIndexRef.current = (liveKeyIndexRef.current + 1) % cleanedKeys.length;
-                  console.warn(`[Gemini-Live] Key kena quota 429, merotasi ke Key #${(liveKeyIndexRef.current % cleanedKeys.length) + 1}...`);
                   setLiveStatus('RECONNECTING...');
-                  setLiveErrorMessage(`Kuota Key #${(currentKeyIdx + 1)} habis, beralih ke Key #${(liveKeyIndexRef.current % cleanedKeys.length) + 1}...`);
+                  setLiveErrorMessage(`Koneksi terganggu, beralih ke Key #${(liveKeyIndexRef.current % cleanedKeys.length) + 1}...`);
                   setTimeout(() => {
                     if (isMounted) setReconnectTrigger(prev => prev + 1);
                   }, 1500);
@@ -680,8 +794,11 @@ Instruksi Perilaku Live Call:
                   setLiveStatus('QUOTA EXHAUSTED');
                   setLiveErrorMessage('Kuota Gratisan Habis (Error 429).');
                 } else {
-                  setLiveStatus('ERROR');
-                  setLiveErrorMessage('Koneksi terganggu.');
+                  setLiveStatus('RECONNECTING...');
+                  setLiveErrorMessage('Koneksi terganggu. Mencoba menyambung kembali...');
+                  setTimeout(() => {
+                    if (isMounted) setReconnectTrigger(prev => prev + 1);
+                  }, 2000);
                 }
               }
             },
@@ -704,15 +821,23 @@ Instruksi Perilaku Live Call:
       } catch (err: any) {
         if (isMounted) {
           const errMsg = (err?.message || '').toLowerCase();
-          const rawKey = geminiApiKey || (typeof localStorage !== 'undefined' ? localStorage.getItem('gemini_api_key') : '') || '';
-          const cleanedKeys = rawKey.split(/[\r\n,;\s]+/).filter(k => k.length > 10);
+          const rawKeyInput = geminiApiKey || (typeof localStorage !== 'undefined' ? (localStorage.getItem('gemini_api_key') || localStorage.getItem('lumina_gemini_api_key')) : '') || '';
+          const cleanedKeys = (typeof rawKeyInput === 'string' ? rawKeyInput.split(/[\r\n,;\s]+/) : []).map(k => k.trim()).filter(k => k.length > 10);
 
-          if ((errMsg.includes('429') || errMsg.includes('quota')) && cleanedKeys.length > 1) {
+          const isNetworkOrQuota = errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('network') || errMsg.includes('fetch') || errMsg.includes('timeout');
+          if (isNetworkOrQuota && cleanedKeys.length > 1) {
             liveKeyIndexRef.current = (liveKeyIndexRef.current + 1) % cleanedKeys.length;
-            setLiveErrorMessage(`Key kena limit kuota, mencoba Key #${(liveKeyIndexRef.current % cleanedKeys.length) + 1}...`);
+            setLiveErrorMessage(`Koneksi/Limit tercapai, mencoba Key #${(liveKeyIndexRef.current % cleanedKeys.length) + 1}...`);
             setTimeout(() => {
               if (isMounted) setReconnectTrigger(prev => prev + 1);
             }, 1500);
+            return;
+          } else if (isNetworkOrQuota) {
+            setLiveStatus('RECONNECTING...');
+            setLiveErrorMessage('Koneksi terganggu. Mencoba menyambung kembali...');
+            setTimeout(() => {
+              if (isMounted) setReconnectTrigger(prev => prev + 1);
+            }, 2000);
             return;
           }
 
