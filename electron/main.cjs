@@ -2812,6 +2812,25 @@ function createMenuView() {
     
   menuView.loadURL(menuUrl);
   
+  menuView.webContents.on('dom-ready', () => {
+    if (menuView && !menuView.isDestroyed() && menuView.webContents) {
+      menuView.webContents.insertCSS(`
+        html, body, #root {
+          overflow: hidden !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          background: transparent !important;
+          scrollbar-width: none !important;
+        }
+        ::-webkit-scrollbar {
+          display: none !important;
+          width: 0 !important;
+          height: 0 !important;
+        }
+      `);
+    }
+  });
+
   menuView.on('blur', () => {
     menuView.webContents.send('hide-menu');
     setTimeout(() => {
@@ -2889,7 +2908,7 @@ function createWebContextMenuView(parentWin) {
   const parent = parentWin || mainWindow;
   const acrylicEnabled = browserSettings.acrylicEnabled !== false;
   webContextMenuView = new BrowserWindow({
-    width: lastWebContextMenuWidth || 200,
+    width: lastWebContextMenuWidth || 280,
     height: lastWebContextMenuHeight || 250,
     frame: false,
     transparent: !acrylicEnabled,
@@ -2912,6 +2931,25 @@ function createWebContextMenuView(parentWin) {
     : `http://localhost:3000?view=web-context-menu&lang=${currentLanguage}`;
     
   webContextMenuView.loadURL(url);
+
+  webContextMenuView.webContents.on('dom-ready', () => {
+    if (webContextMenuView && !webContextMenuView.isDestroyed() && webContextMenuView.webContents) {
+      webContextMenuView.webContents.insertCSS(`
+        html, body, #root {
+          overflow: hidden !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          background: transparent !important;
+          scrollbar-width: none !important;
+        }
+        ::-webkit-scrollbar {
+          display: none !important;
+          width: 0 !important;
+          height: 0 !important;
+        }
+      `);
+    }
+  });
 
   webContextMenuView.on('blur', () => {
     if (webContextMenuView && !webContextMenuView.isDestroyed()) {
