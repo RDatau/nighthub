@@ -136,10 +136,10 @@ export const WebContextMenu: React.FC = () => {
     <div 
       ref={containerRef} 
       id="web-context-menu-container"
-      className={`flex flex-col gap-0.5 p-2 border border-black/20 dark:border-white/10 shadow-xl overflow-hidden h-full w-full min-w-[280px] max-w-[380px] select-none font-sans ${
+      className={`flex flex-col gap-0.5 p-2 border border-black/20 dark:border-white/10 shadow-xl overflow-hidden h-full w-full select-none font-sans ${
         acrylicEnabled 
-          ? 'bg-white/60 dark:bg-[#000000]/50 backdrop-blur-md pr-4 pb-2.5' 
-          : 'bg-white dark:bg-[#1c1c1b] rounded-xl'
+          ? 'bg-white/60 dark:bg-[#000000]/50 backdrop-blur-md pr-4 pb-2.5 min-w-[280px] max-w-[380px]' 
+          : 'bg-white dark:bg-[#1c1c1b] rounded-xl min-w-[200px] max-w-[300px]'
       }`}
     >
       {items.map((item, index) => {
