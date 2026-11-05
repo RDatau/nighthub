@@ -258,6 +258,107 @@ export default function App() {
   const [showNetworkModal, setShowNetworkModal] = useState(false);
   const [networkUrl, setNetworkUrl] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
+
+  // YouTube Stream & Separate Audio Track Sync
+  const youtubeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [activeAudioUrl, setActiveAudioUrl] = useState<string>('');
+
+  const isYouTubeUrl = (url: string) => {
+    return typeof url === 'string' && /^(https?:\/\/)?(www\.|m\.|music\.)?(youtube\.com|youtu\.be)\/.+/i.test(url);
+  };
+
+  const resolveYouTubeStream = async (url: string) => {
+    const ipc = getIpcRenderer();
+    if (ipc) {
+      try {
+        const res = await ipc.invoke('resolve-youtube-url', url);
+        if (res && res.success) return res;
+      } catch (e) {
+        console.warn('IPC resolve-youtube-url failed:', e);
+      }
+    }
+    try {
+      const resp = await fetch('/api/resolve-youtube', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url })
+      });
+      const res = await resp.json();
+      if (res && res.success) return res;
+    } catch (e) {
+      console.error('Fetch /api/resolve-youtube failed:', e);
+    }
+    return null;
+  };
+
+  useEffect(() => {
+    if (!youtubeAudioRef.current || !videoRef.current || !activeAudioUrl) return;
+    const audio = youtubeAudioRef.current;
+    const video = videoRef.current;
+
+    const syncAudioProps = () => {
+      audio.muted = video.muted;
+      audio.volume = video.volume;
+      audio.playbackRate = video.playbackRate;
+      if (Math.abs(audio.currentTime - video.currentTime) > 0.15) {
+        audio.currentTime = video.currentTime;
+      }
+    };
+
+    const handlePlay = () => {
+      syncAudioProps();
+      audio.play().catch(e => console.warn('YouTube Audio play failed:', e));
+    };
+
+    const handlePause = () => {
+      audio.pause();
+    };
+
+    const handleSeeking = () => {
+      audio.currentTime = video.currentTime;
+    };
+
+    const handleTimeUpdate = () => {
+      if (Math.abs(audio.currentTime - video.currentTime) > 0.2) {
+        audio.currentTime = video.currentTime;
+      }
+    };
+
+    const handleVolumeChange = () => {
+      audio.volume = video.volume;
+      audio.muted = video.muted;
+    };
+
+    const handleRateChange = () => {
+      audio.playbackRate = video.playbackRate;
+    };
+
+    video.addEventListener('play', handlePlay);
+    video.addEventListener('playing', handlePlay);
+    video.addEventListener('canplay', handlePlay);
+    video.addEventListener('pause', handlePause);
+    video.addEventListener('seeking', handleSeeking);
+    video.addEventListener('timeupdate', handleTimeUpdate);
+    video.addEventListener('volumechange', handleVolumeChange);
+    video.addEventListener('ratechange', handleRateChange);
+
+    syncAudioProps();
+    if (!video.paused) {
+      audio.play().catch(() => {});
+    }
+
+    return () => {
+      video.removeEventListener('play', handlePlay);
+      video.removeEventListener('playing', handlePlay);
+      video.removeEventListener('canplay', handlePlay);
+      video.removeEventListener('pause', handlePause);
+      video.removeEventListener('seeking', handleSeeking);
+      video.removeEventListener('timeupdate', handleTimeUpdate);
+      video.removeEventListener('volumechange', handleVolumeChange);
+      video.removeEventListener('ratechange', handleRateChange);
+    };
+  }, [activeAudioUrl]);
+
   const [showSaveModal, setShowSaveModal] = useState(false);
   const [showLoadModal, setShowLoadModal] = useState(false);
   const [collectionName, setCollectionName] = useState('');
@@ -1070,7 +1171,7 @@ export default function App() {
     }
   }, []);
 
-  const handlePlayFromSniffer = async (url: string, referer?: string, title?: string) => {
+  const handlePlayFromSniffer = async (url: string, referer?: string, title?: string, targetAudioUrl?: string) => {
     // Stop current playback/stream to prevent overlapping streams and freezing issues
     stopPlayback();
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -1109,46 +1210,18 @@ export default function App() {
 
     const isYoutube = url.includes('youtube.com') || url.includes('youtu.be');
     let videoUrlToPlay = url;
+    let resolvedAudioUrl = targetAudioUrl || '';
 
-    if (isYoutube) {
+    if (isYoutube && (!videoUrlToPlay || !videoUrlToPlay.includes('googlevideo.com') || !resolvedAudioUrl)) {
       showFeedback(preferenceSettings.language === 'id' ? 'Menyiapkan aliran video YouTube... ⏳' : 'Resolving YouTube stream... ⏳');
-      let resolved = false;
-
-      if (ipc) {
-        try {
-          const resolvedUrl = await ipc.invoke('resolve-youtube', url);
-          if (resolvedUrl) {
-            videoUrlToPlay = resolvedUrl;
-            resolved = true;
-          }
-        } catch (err) {
-          console.error('Failed to resolve YouTube URL via backend yt-dlp:', err);
+      const ytRes = await resolveYouTubeStream(url);
+      if (ytRes && (ytRes.videoUrl || ytRes.combinedUrl)) {
+        videoUrlToPlay = ytRes.combinedUrl || ytRes.videoUrl;
+        if (ytRes.audioUrl) {
+          resolvedAudioUrl = ytRes.audioUrl;
         }
-      }
-
-      if (!resolved) {
-        try {
-          const res = await fetch('https://api.cobalt.tools/api/json', {
-            method: 'POST',
-            headers: {
-              'Accept': 'application/json',
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              url: url,
-              videoQuality: '720',
-              downloadMode: 'auto'
-            })
-          });
-          const cobaltData = await res.json();
-          if (cobaltData && cobaltData.url) {
-            videoUrlToPlay = cobaltData.url;
-            resolved = true;
-          } else {
-            console.warn('Cobalt did not return url, playing original:', cobaltData);
-          }
-        } catch (err) {
-          console.error('Failed to resolve YouTube URL:', err);
+        if (ytRes.title && (resolvedTitle === 'Streaming Video' || !resolvedTitle)) {
+          Object.defineProperty(fakeFile, 'name', { value: ytRes.title, configurable: true });
         }
       }
     }
@@ -1156,7 +1229,12 @@ export default function App() {
     if (ipc) {
       ipc.send('set-main-player-referer', referer || '');
       try {
-        const proxyUrl = isYoutube ? videoUrlToPlay : await ipc.invoke('get-proxy-url', videoUrlToPlay, referer || '');
+        const proxyUrl = await ipc.invoke('get-proxy-url', videoUrlToPlay, referer || '');
+        let proxyAudioUrl = '';
+        if (resolvedAudioUrl) {
+          proxyAudioUrl = await ipc.invoke('get-proxy-url', resolvedAudioUrl, referer || '');
+        }
+        setActiveAudioUrl(proxyAudioUrl || resolvedAudioUrl);
         player.setVideoSrc(proxyUrl || videoUrlToPlay);
         player.setIsPlaying(true);
         setShowWebSniffer(false);
@@ -1165,12 +1243,23 @@ export default function App() {
           : t('playingFromSnifferCached', preferenceSettings.language || 'id') + ' 🚀'
         );
       } catch (e) {
+        if (resolvedAudioUrl && resolvedAudioUrl.startsWith('http')) {
+          resolvedAudioUrl = `/proxy?url=${encodeURIComponent(resolvedAudioUrl)}`;
+        }
+        setActiveAudioUrl(resolvedAudioUrl);
         player.setVideoSrc(videoUrlToPlay);
         player.setIsPlaying(true);
         setShowWebSniffer(false);
         showFeedback(t('playingFromSniffer', preferenceSettings.language || 'id') + ' 🚀');
       }
     } else {
+      if (resolvedAudioUrl && resolvedAudioUrl.startsWith('http')) {
+        resolvedAudioUrl = `/proxy?url=${encodeURIComponent(resolvedAudioUrl)}`;
+      }
+      if (videoUrlToPlay && videoUrlToPlay.startsWith('http') && !videoUrlToPlay.startsWith('/proxy')) {
+        videoUrlToPlay = `/proxy?url=${encodeURIComponent(videoUrlToPlay)}`;
+      }
+      setActiveAudioUrl(resolvedAudioUrl);
       player.setVideoSrc(videoUrlToPlay);
       player.setIsPlaying(true);
       setShowWebSniffer(false);
@@ -2054,8 +2143,33 @@ export default function App() {
     }
 
     let url = '';
+    let targetAudioUrl = '';
+
     if ((file as any).isStream) {
-      url = (file as any).url || (file as any).path; // Sniffed videos store url in path
+      let rawStreamUrl = (file as any).url || (file as any).path;
+      const ytTarget = (file as any).youtubeUrl || rawStreamUrl;
+
+      if (isYouTubeUrl(rawStreamUrl) || isYouTubeUrl(ytTarget) || (file as any).isYouTube) {
+        if (!rawStreamUrl || isYouTubeUrl(rawStreamUrl)) {
+          showFeedback(preferenceSettingsRef.current.language === 'id' ? 'Mengekstrak stream YouTube...' : 'Extracting YouTube stream...');
+          const ytRes = await resolveYouTubeStream(ytTarget);
+          if (ytRes && (ytRes.videoUrl || ytRes.combinedUrl)) {
+            rawStreamUrl = ytRes.combinedUrl || ytRes.videoUrl;
+            (file as any).path = rawStreamUrl;
+            (file as any).url = rawStreamUrl;
+            (file as any).isYouTube = true;
+            (file as any).youtubeUrl = ytTarget;
+            if (ytRes.audioUrl) {
+              (file as any).audioUrl = ytRes.audioUrl;
+            }
+            if (ytRes.title && (file.name === ytTarget || !file.name)) {
+              (file as any).name = ytRes.title;
+            }
+          }
+        }
+        targetAudioUrl = (file as any).audioUrl || '';
+      }
+      url = rawStreamUrl;
     } else if ((file as any).path && electron.isElectron) {
       url = electron.getLocalFileUrl((file as any).path);
     } else if (file instanceof Blob) {
@@ -2086,13 +2200,25 @@ export default function App() {
         } catch (e) {
           // Fallback to original url
         }
+        if (targetAudioUrl) {
+          try {
+            const proxyAudioUrl = await ipc.invoke('get-proxy-url', targetAudioUrl, '');
+            targetAudioUrl = proxyAudioUrl || targetAudioUrl;
+          } catch (e) {
+            // Fallback
+          }
+        }
       } else {
         player.setOriginalVideoSrc(null);
       }
     } else {
       player.setOriginalVideoSrc(null);
+      if ((file as any).isStream && targetAudioUrl && targetAudioUrl.startsWith('http')) {
+        targetAudioUrl = `/proxy?url=${encodeURIComponent(targetAudioUrl)}`;
+      }
     }
 
+    setActiveAudioUrl(targetAudioUrl);
     player.setVideoSrc(url);
     setShowPlayer(true);
     
@@ -2736,7 +2862,7 @@ export default function App() {
     console.warn(`Video Error: ${errorMsg} (Code: ${video.error?.code})`);
   };
 
-  const handleNetworkStream = () => {
+  const handleNetworkStream = async () => {
     if (networkUrl.trim()) {
       const url = networkUrl.trim();
       
@@ -2748,6 +2874,40 @@ export default function App() {
       }
 
       electron.logToMain(`Opening network stream: ${url}`);
+
+      if (isYouTubeUrl(url)) {
+        showFeedback(preferenceSettings.language === 'id' ? 'Mengekstrak stream YouTube...' : 'Extracting YouTube stream...');
+        const ytData = await resolveYouTubeStream(url);
+        if (ytData && (ytData.videoUrl || ytData.combinedUrl)) {
+          const streamFile = {
+            name: ytData.title || url,
+            path: ytData.combinedUrl || ytData.videoUrl,
+            isStream: true,
+            isYouTube: true,
+            youtubeUrl: url,
+            audioUrl: ytData.audioUrl || '',
+            url: ytData.combinedUrl || ytData.videoUrl,
+            type: 'video/mp4',
+            size: 0,
+          } as unknown as File;
+
+          const newPlaylist = [...playlist.playlist, streamFile];
+          playlist.setPlaylist(newPlaylist);
+          playVideoIndex(newPlaylist.length - 1, newPlaylist);
+
+          if (ytData.thumbnail) {
+            const key = streamFile.name + streamFile.size;
+            playlist.setThumbnails(prev => ({ ...prev, [key]: ytData.thumbnail }));
+          }
+
+          setShowNetworkModal(false);
+          setNetworkUrl('');
+          showFeedback(preferenceSettings.language === 'id' ? `Memutar YouTube: ${ytData.title}` : `Playing YouTube: ${ytData.title}`);
+          return;
+        } else {
+          showFeedback(preferenceSettings.language === 'id' ? 'Gagal mengekstrak YouTube stream. Mencoba stream langsung...' : 'Failed to extract YouTube stream. Trying direct stream...');
+        }
+      }
       
       const streamFile = {
         name: url.split('/').pop()?.split('?')[0] || url,
@@ -4674,6 +4834,9 @@ export default function App() {
           >
             {subtitles.subtitleUrl && <track kind="subtitles" src={subtitles.subtitleUrl} default />}
           </video>
+          {activeAudioUrl && (
+            <audio ref={youtubeAudioRef} src={activeAudioUrl} preload="auto" className="hidden" />
+          )}
 
           {/* DECK B: Dual Video Deck / Seamless Transition Engine */}
           <div

@@ -88,6 +88,7 @@
     }
   },
   "dependencies": {
+    "@distube/ytdl-core": "^5.2.1",
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "@ffprobe-installer/ffprobe": "^2.1.2",
     "@ghostery/adblocker-electron": "^2.14.1",

@@ -669,6 +669,52 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
   }
 });
 
+// API Endpoint to resolve YouTube links to direct stream URLs
+app.post("/api/resolve-youtube", async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url || typeof url !== "string") {
+      return res.status(400).json({ success: false, error: "URL YouTube tidak valid." });
+    }
+
+    const { Ytdl } = await import("@distube/ytdl-core");
+    const ytdl = new Ytdl();
+    const info = await ytdl.getInfo(url);
+
+    if (!info || !info.formats || info.formats.length === 0) {
+      return res.status(400).json({ success: false, error: "Gagal mengambil format video YouTube." });
+    }
+
+    const videoOnly = info.formats.filter((f) => f.hasVideo && !f.hasAudio);
+    const audioOnly = info.formats.filter((f) => f.hasAudio && !f.hasVideo);
+    const combined = info.formats.filter((f) => f.hasVideo && f.hasAudio);
+
+    const bestVideo = videoOnly.length > 0 ? videoOnly[0] : (combined.length > 0 ? combined[0] : info.formats[0]);
+    const bestAudio = audioOnly.length > 0 ? audioOnly[0] : null;
+
+    const thumbnail = info.videoDetails.thumbnails?.[info.videoDetails.thumbnails.length - 1]?.url || "";
+    const title = info.videoDetails.title || "YouTube Stream";
+    const duration = typeof info.videoDetails.lengthSeconds === 'number' ? info.videoDetails.lengthSeconds : (parseInt(String(info.videoDetails.lengthSeconds || '0'), 10) || 0);
+
+    res.json({
+      success: true,
+      title,
+      videoUrl: bestVideo ? bestVideo.url : "",
+      audioUrl: bestAudio ? bestAudio.url : "",
+      combinedUrl: combined.length > 0 ? combined[0].url : "",
+      thumbnail,
+      duration,
+      formatQuality: bestVideo ? (bestVideo.qualityLabel || bestVideo.quality || "") : "",
+    });
+  } catch (error: any) {
+    console.error("Error resolving YouTube URL in server.ts:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message || "Gagal memproses link YouTube dengan yt-dlp/ytdl.",
+    });
+  }
+});
+
 // Vite server configuration
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {

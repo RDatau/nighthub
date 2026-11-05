@@ -14,6 +14,7 @@ interface DetectedVideo {
   timestamp: number;
   size?: string;
   title?: string;
+  audioUrl?: string;
 }
 
 const formatSpeed = (bytesPerSec?: number) => {
@@ -79,7 +80,7 @@ export const WebSnifferModal = ({
   initialUrl?: string | null;
   onClearInitialUrl?: () => void;
   onClose: () => void;
-  onPlay: (url: string, referer?: string, title?: string) => void;
+  onPlay: (url: string, referer?: string, title?: string, targetAudioUrl?: string) => void;
   getIpcRenderer: () => any;
   logToMain: (msg: string) => void;
   lang?: Language;
@@ -169,6 +170,70 @@ export const WebSnifferModal = ({
   const [folderPrompt, setFolderPrompt] = useState<{ show: boolean, mode: 'create' | 'rename', folderId?: string, initialName?: string, parentId?: string | null }>({ show: false, mode: 'create' });
   const [folderPromptInput, setFolderPromptInput] = useState('');
   const [deleteConfirm, setDeleteConfirm] = useState<{ show: boolean, mode: 'all' | 'folder', folderId?: string, folderName?: string }>({ show: false, mode: 'all' });
+  const [isExtractingYoutube, setIsExtractingYoutube] = useState(false);
+  const [youtubeInput, setYoutubeInput] = useState('');
+
+  const isYouTubeUrl = (urlStr?: string): boolean => {
+    if (!urlStr) return false;
+    return /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)/i.test(urlStr);
+  };
+
+  const handleExtractYouTube = async (targetUrl?: string) => {
+    const rawTarget = (targetUrl || youtubeInput || url).trim();
+    if (!rawTarget) return;
+
+    setIsExtractingYoutube(true);
+    try {
+      const ipc = getIpcRenderer();
+      let res: any = null;
+
+      if (ipc) {
+        try {
+          res = await ipc.invoke('resolve-youtube-url', rawTarget);
+        } catch (e) {
+          console.warn('IPC resolve-youtube-url failed:', e);
+        }
+      }
+
+      if (!res || !res.success) {
+        try {
+          const resp = await fetch('/api/resolve-youtube', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: rawTarget }),
+          });
+          res = await resp.json();
+        } catch (e) {
+          console.warn('Fetch /api/resolve-youtube failed:', e);
+        }
+      }
+
+      if (res && res.success && (res.videoUrl || res.combinedUrl)) {
+        const streamUrl = res.combinedUrl || res.videoUrl;
+        const newDetected: DetectedVideo = {
+          url: streamUrl,
+          type: 'YOUTUBE_HD',
+          timestamp: Date.now(),
+          size: res.formatQuality || 'HD Stream',
+          title: res.title || 'YouTube Video',
+          audioUrl: res.audioUrl
+        };
+        setDetectedVideos(prev => {
+          if (prev.some(v => v.url === streamUrl)) return prev;
+          return [newDetected, ...prev];
+        });
+        setShowSidebar(true);
+        setYoutubeInput('');
+      } else {
+        alert(lang === 'id' ? 'Gagal mengekstrak video YouTube: ' + (res?.error || 'Tidak ada stream') : 'Failed to extract YouTube video.');
+      }
+    } catch (err: any) {
+      console.error('Failed to extract YouTube stream:', err);
+      alert(lang === 'id' ? 'Gagal mengekstrak video YouTube.' : 'Failed to extract YouTube stream.');
+    } finally {
+      setIsExtractingYoutube(false);
+    }
+  };
 
   // Password Manager states
   const [credentials, setCredentials] = useState<SavedCredential[]>([]);
@@ -1488,7 +1553,7 @@ ${renderFolder(null)}</DL><p>`;
       .filter(v => v.url && v.url.includes('.m3u8'))
       .map(v => ({ url: v.url, timestamp: v.timestamp }));
 
-    ipc.send('download-hls', video.url, defaultName, url, activeTabId, allDetectedM3u8s); // Pass current page url as referer, activeTabId, and similar URLs
+    ipc.send('download-hls', video.url, defaultName, url, activeTabId, allDetectedM3u8s, video.audioUrl); // Pass current page url as referer, activeTabId, similar URLs, and audioUrl
   };
 
   const handleCancelDownload = (url: string) => {
@@ -3222,8 +3287,52 @@ ${renderFolder(null)}</DL><p>`;
             </div>
             
             <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar min-h-0">
+              {/* YouTube Stream Extraction Card */}
+              <div className="bg-red-500/10 dark:bg-red-500/15 border border-red-500/20 rounded-xl p-3 flex flex-col gap-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-bold text-red-600 dark:text-red-400 flex items-center gap-1.5 uppercase tracking-wider">
+                    <Play size={12} fill="currentColor" />
+                    {lang === 'id' ? 'YouTube Stream Extractor' : 'YouTube Stream Extractor'}
+                  </span>
+                  {isExtractingYoutube && (
+                    <RefreshCw size={12} className="animate-spin text-red-500" />
+                  )}
+                </div>
+
+                {isYouTubeUrl(url) && (
+                  <button
+                    onClick={() => handleExtractYouTube(url)}
+                    disabled={isExtractingYoutube}
+                    className="w-full py-1.5 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-bold transition-all shadow-md flex items-center justify-center gap-1.5 disabled:opacity-50"
+                  >
+                    <Play size={13} fill="currentColor" />
+                    <span>{isExtractingYoutube ? (lang === 'id' ? 'Mengekstrak YouTube...' : 'Extracting YouTube...') : (lang === 'id' ? 'Ambil Stream YouTube Halaman Ini' : 'Extract YouTube Stream from Page')}</span>
+                  </button>
+                )}
+
+                <div className="flex gap-1.5 mt-0.5">
+                  <input
+                    type="text"
+                    placeholder="https://youtube.com/watch?v=..."
+                    value={youtubeInput}
+                    onChange={(e) => setYoutubeInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleExtractYouTube();
+                    }}
+                    className="flex-1 bg-white dark:bg-black/40 text-xs px-2.5 py-1.5 rounded-lg border border-black/10 dark:border-white/10 text-zinc-900 dark:text-white focus:outline-none focus:border-red-500"
+                  />
+                  <button
+                    onClick={() => handleExtractYouTube()}
+                    disabled={isExtractingYoutube || !youtubeInput.trim()}
+                    className="px-3 py-1.5 bg-red-600 hover:bg-red-500 disabled:opacity-40 text-white rounded-lg text-xs font-bold transition-all shrink-0"
+                  >
+                    {lang === 'id' ? 'Ambil' : 'Extract'}
+                  </button>
+                </div>
+              </div>
+
               {detectedVideos.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-zinc-700 dark:text-zinc-300 gap-4 opacity-50">
+                <div className="h-full flex flex-col items-center justify-center text-zinc-700 dark:text-zinc-300 gap-4 opacity-50 py-8">
                   <Search size={48} strokeWidth={1} />
                   <p className="text-xs font-mono uppercase tracking-widest text-center px-4">
                     {isSniffing ? (lang === 'id' ? 'Memantau jaringan...' : 'Monitoring network...') : (lang === 'id' ? 'Mulai jelajahi untuk menangkap video' : 'Browse to capture video streams')}
@@ -3272,7 +3381,7 @@ ${renderFolder(null)}</DL><p>`;
                         {copiedUrl === video.url ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
                       </button>
                       <button 
-                        onClick={() => onPlay(video.url, url, video.title || pageTitle)}
+                        onClick={() => onPlay(video.url, url, video.title || pageTitle, video.audioUrl)}
                         className="flex-1 py-1.5 bg-orange-500/20 dark:bg-amber-500/20 hover:bg-orange-500/30 dark:hover:bg-amber-500/30 text-orange-600 dark:text-amber-500 rounded-lg transition-all flex justify-center items-center"
                         title={t('directPlay', lang)}
                       >

@@ -97,7 +97,7 @@ export function SearchEngineMenu() {
       `}</style>
       <div className={`flex flex-col gap-2 p-3.5 shadow-xl overflow-hidden ${
         acrylicEnabled 
-          ? 'bg-white/60 dark:bg-[#000000]/65 backdrop-blur-md' 
+          ? 'bg-white/60 dark:bg-[#000000]/50 backdrop-blur-md' 
           : 'bg-white dark:bg-[#1c1c1b] border border-black/10 dark:border-white/10 rounded-2xl'
       }`}>
         <div className="px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500 dark:text-zinc-400 opacity-60">

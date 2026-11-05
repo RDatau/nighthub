@@ -100,7 +100,7 @@ export function SearchSuggestionsDropdown() {
     <div className="h-screen w-screen bg-transparent overflow-hidden select-none flex flex-col">
       <div className={`flex-1 flex flex-col border border-black/10 dark:border-white/10 shadow-2xl overflow-hidden max-h-[340px] ${
         acrylicEnabled 
-          ? 'bg-white/60 dark:bg-[#000000]/65 backdrop-blur-md' 
+          ? 'bg-white/60 dark:bg-[#000000]/50 backdrop-blur-md' 
           : 'bg-white dark:bg-[#1c1c1b] rounded-xl'
       }`}>
         <div className="overflow-y-auto custom-scrollbar flex-1">

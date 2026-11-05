@@ -15,7 +15,8 @@ process.on('uncaughtException', (err) => {
     errStr.includes('EPIPE') ||
     errStr.includes('ETIMEDOUT') ||
     errStr.includes('ERR_STREAM_PREMATURE_CLOSE') ||
-    errStr.includes('Socket closed')
+    errStr.includes('Socket closed') ||
+    errStr.includes('EADDRINUSE')
   ) {
     console.warn('[ELECTRON BACKGROUND NETWORK EXCEPTION SUPPRESSED]:', errStr);
     return;
@@ -849,7 +850,10 @@ aiApiApp.post('/api/ai/live-comment', async (req, res) => {
 const aiApiServer = http.createServer(aiApiApp);
 aiApiServer.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
-    console.log('[AI API SERVER] Port 3000 already bound (dev mode / external server active).');
+    console.log('[AI API SERVER] Port 3000 already bound (dev mode / external server active). Binding to dynamic fallback port...');
+    try {
+      aiApiServer.listen(0, '127.0.0.1');
+    } catch (_) {}
   } else {
     console.error('[AI API SERVER ERROR]', err);
   }
@@ -1045,6 +1049,44 @@ ipcMain.handle('get-proxy-status', (event, url) => {
     status: info.status
   };
 });
+
+ipcMain.removeHandler('resolve-youtube-url');
+ipcMain.handle('resolve-youtube-url', async (event, url) => {
+  if (!url || typeof url !== 'string') return { success: false, error: 'URL tidak valid' };
+  try {
+    const { Ytdl } = require('@distube/ytdl-core');
+    const ytdl = new Ytdl();
+    const info = await ytdl.getInfo(url);
+    if (!info || !info.formats || info.formats.length === 0) {
+      return { success: false, error: 'Format video tidak ditemukan' };
+    }
+    const videoOnly = info.formats.filter((f) => f.hasVideo && !f.hasAudio);
+    const audioOnly = info.formats.filter((f) => f.hasAudio && !f.hasVideo);
+    const combined = info.formats.filter((f) => f.hasVideo && f.hasAudio);
+
+    const bestVideo = videoOnly.length > 0 ? videoOnly[0] : (combined.length > 0 ? combined[0] : info.formats[0]);
+    const bestAudio = audioOnly.length > 0 ? audioOnly[0] : null;
+
+    const thumbnail = info.videoDetails.thumbnails?.[info.videoDetails.thumbnails.length - 1]?.url || '';
+    const title = info.videoDetails.title || 'YouTube Stream';
+    const duration = parseInt(info.videoDetails.lengthSeconds, 10) || 0;
+
+    return {
+      success: true,
+      title,
+      videoUrl: bestVideo ? bestVideo.url : '',
+      audioUrl: bestAudio ? bestAudio.url : '',
+      combinedUrl: combined.length > 0 ? combined[0].url : '',
+      thumbnail,
+      duration,
+      formatQuality: bestVideo ? (bestVideo.qualityLabel || bestVideo.quality || '') : '',
+    };
+  } catch (err) {
+    console.error('[YTDL IPC ERROR]', err);
+    return { success: false, error: err.message || 'Gagal memproses URL YouTube.' };
+  }
+});
+
 
 // --- LIBMPV / MPV NATIVE PLAYER PROCESS MANAGEMENT ---
 const { spawn } = require('child_process');
@@ -5634,7 +5676,38 @@ ipcMain.on('set-multipart-download', (event, value) => {
   useMultiPartDownload = value;
 });
 
-ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDetectedM3u8s) => {
+async function resolveYouTubeStreams(targetUrl) {
+  if (!targetUrl || typeof targetUrl !== 'string') return null;
+  try {
+    const { Ytdl } = require('@distube/ytdl-core');
+    const ytdl = new Ytdl();
+    const info = await ytdl.getInfo(targetUrl);
+    if (!info || !info.formats || info.formats.length === 0) return null;
+
+    const videoOnly = info.formats.filter(f => f.hasVideo && !f.hasAudio);
+    const audioOnly = info.formats.filter(f => f.hasAudio && !f.hasVideo);
+    const combined = info.formats.filter(f => f.hasVideo && f.hasAudio);
+
+    videoOnly.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
+    audioOnly.sort((a, b) => (b.audioBitrate || b.bitrate || 0) - (a.audioBitrate || a.bitrate || 0));
+    combined.sort((a, b) => (b.height || 0) - (a.height || 0) || (b.bitrate || 0) - (a.bitrate || 0));
+
+    const bestVideo = videoOnly.length > 0 ? videoOnly[0] : (combined.length > 0 ? combined[0] : info.formats[0]);
+    const bestAudio = audioOnly.length > 0 ? audioOnly[0] : null;
+
+    return {
+      title: info.videoDetails?.title || 'YouTube Stream',
+      videoUrl: bestVideo ? bestVideo.url : '',
+      audioUrl: bestAudio ? bestAudio.url : '',
+      combinedUrl: combined.length > 0 ? combined[0].url : '',
+    };
+  } catch (err) {
+    logStream(`[YTDL RESOLVE HELPER ERROR] ${err.message}`);
+    return null;
+  }
+}
+
+ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDetectedM3u8s, audioUrl) => {
   const { dialog } = require('electron');
   const win = BrowserWindow.fromWebContents(event.sender);
   
@@ -5676,6 +5749,10 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
     const inputOptions = [
       '-protocol_whitelist file,http,https,tcp,tls,crypto',
       '-rw_timeout 30000000',
+      '-reconnect', '1',
+      '-reconnect_at_eof', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
       '-user_agent', userAgent,
       '-probesize', '10M',
       '-analyzeduration', '10M',
@@ -5742,41 +5819,29 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
     let currentSpeed = 0;
 
     let finalUrl = url;
-    const isYoutube = url.includes('youtube.com') || url.includes('youtu.be');
-    if (isYoutube) {
-      logStream(`[YOUTUBE DOWNLOAD] Resolving YouTube URL: ${url}`);
-      try {
-        const resolvedUrl = await resolveYoutubeWithYtDlp(url);
-        logStream(`[YOUTUBE DOWNLOAD SUCCESS] Successfully resolved via yt-dlp: ${resolvedUrl}`);
-        finalUrl = resolvedUrl;
-      } catch (ytDlpErr) {
-        logStream(`[YOUTUBE DOWNLOAD YT-DLP FAILED] yt-dlp failed: ${ytDlpErr.message}. Falling back to Cobalt...`);
-        try {
-          const fetchClient = (net && typeof net.fetch === 'function') ? net.fetch : require('cross-fetch');
-          const res = await fetchClient('https://api.cobalt.tools/api/json', {
-            method: 'POST',
-            headers: {
-              'Accept': 'application/json',
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              url: url,
-              videoQuality: '720',
-              downloadMode: 'auto'
-            })
-          });
-          const cobaltData = await res.json();
-          if (cobaltData && cobaltData.url) {
-            logStream(`[YOUTUBE DOWNLOAD COBALT FALLBACK SUCCESS] Successfully resolved via Cobalt fallback: ${cobaltData.url}`);
-            finalUrl = cobaltData.url;
+    let finalAudioUrl = audioUrl || null;
+
+    const isYoutube = url.includes('youtube.com') || url.includes('youtu.be') || (referer && (referer.includes('youtube.com') || referer.includes('youtu.be')));
+    if (isYoutube || !finalAudioUrl) {
+      if (!finalAudioUrl && (url.includes('youtube.com') || url.includes('youtu.be'))) {
+        logStream(`[YOUTUBE DOWNLOAD] Resolving YouTube URL for video + audio: ${url}`);
+        const ytInfo = await resolveYouTubeStreams(url);
+        if (ytInfo) {
+          if (ytInfo.videoUrl && ytInfo.audioUrl) {
+            finalUrl = ytInfo.videoUrl;
+            finalAudioUrl = ytInfo.audioUrl;
+          } else if (ytInfo.combinedUrl) {
+            finalUrl = ytInfo.combinedUrl;
           } else {
-            throw new Error((cobaltData && cobaltData.message) || 'No stream URL returned from Cobalt');
+            if (ytInfo.videoUrl) finalUrl = ytInfo.videoUrl;
+            if (ytInfo.audioUrl) finalAudioUrl = ytInfo.audioUrl;
           }
-        } catch (err) {
-          logStream(`[YOUTUBE DOWNLOAD ERROR] Both yt-dlp and Cobalt failed to resolve YouTube URL: ${err.message}`);
-          event.reply('download-progress', { url, status: 'error', error: 'Gagal mendapatkan aliran download YouTube.' });
-          if (tabId) decrementDownloadTab(tabId);
-          return;
+        }
+      } else if (!finalAudioUrl && referer && (referer.includes('youtube.com') || referer.includes('youtu.be'))) {
+        logStream(`[YOUTUBE DOWNLOAD] Resolving YouTube Referer URL for audio stream: ${referer}`);
+        const ytInfo = await resolveYouTubeStreams(referer);
+        if (ytInfo && ytInfo.audioUrl) {
+          finalAudioUrl = ytInfo.audioUrl;
         }
       }
     }
@@ -6022,43 +6087,96 @@ ipcMain.on('download-hls', async (event, url, defaultName, referer, tabId, allDe
 
     const startFFmpegDownload = (isFallback) => {
       let outputOptions = [];
-      if (isFallback) {
-        logStream(`[DOWNLOAD FALLBACK] Retrying with full transcoding for problematic stream...`);
-        lastTargetSize = 0;
-        lastTime = Date.now();
-        currentSpeed = 0;
-        event.reply('download-progress', { 
-          url, 
-          status: 'starting', 
-          percent: 0,
-          message: 'Mencoba transcoding video... Silakan tunggu sebentar~'
-        });
-        outputOptions = [
-          '-ignore_unknown',
-          '-map', videoStreamIndex,
-          '-map', '0:a?',
-          '-c:v', 'libx264',
-          '-preset', 'ultrafast',
-          '-pix_fmt', 'yuv420p',
-          '-c:a', 'aac',
-          '-b:a', '128k',
-          '-max_muxing_queue_size', '9999',
-          '-movflags', '+faststart'
-        ];
-      } else {
-        outputOptions = [
-          '-ignore_unknown',
-          '-map', videoStreamIndex,
-          '-map', '0:a?',
-          '-c', 'copy',
-          '-bsf:a', 'aac_adtstoasc',
-          '-max_muxing_queue_size', '9999',
-          '-movflags', '+faststart'
-        ];
+
+      const command = ffmpeg();
+      command.input(finalUrl).inputOptions(inputOptions);
+
+      if (finalAudioUrl) {
+        command.input(finalAudioUrl).inputOptions(inputOptions);
       }
 
-      const command = ffmpeg(finalUrl)
-        .inputOptions(inputOptions)
+      if (finalAudioUrl) {
+        if (isFallback) {
+          logStream(`[DOWNLOAD FALLBACK] Retrying with full transcoding for video + audio stream...`);
+          lastTargetSize = 0;
+          lastTime = Date.now();
+          currentSpeed = 0;
+          event.reply('download-progress', { 
+            url, 
+            status: 'starting', 
+            percent: 0,
+            message: 'Mencoba transcoding video + audio... Silakan tunggu sebentar~'
+          });
+          outputOptions = [
+            '-ignore_unknown',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-fflags', '+genpts',
+            '-avoid_negative_ts', 'make_zero',
+            '-max_muxing_queue_size', '9999',
+            '-movflags', '+faststart'
+          ];
+        } else {
+          outputOptions = [
+            '-ignore_unknown',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-fflags', '+genpts',
+            '-avoid_negative_ts', 'make_zero',
+            '-max_muxing_queue_size', '9999',
+            '-movflags', '+faststart'
+          ];
+        }
+      } else {
+        if (isFallback) {
+          logStream(`[DOWNLOAD FALLBACK] Retrying with full transcoding for problematic stream...`);
+          lastTargetSize = 0;
+          lastTime = Date.now();
+          currentSpeed = 0;
+          event.reply('download-progress', { 
+            url, 
+            status: 'starting', 
+            percent: 0,
+            message: 'Mencoba transcoding video... Silakan tunggu sebentar~'
+          });
+          outputOptions = [
+            '-ignore_unknown',
+            '-map', videoStreamIndex,
+            '-map', '0:a?',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-fflags', '+genpts',
+            '-avoid_negative_ts', 'make_zero',
+            '-max_muxing_queue_size', '9999',
+            '-movflags', '+faststart'
+          ];
+        } else {
+          outputOptions = [
+            '-ignore_unknown',
+            '-map', videoStreamIndex,
+            '-map', '0:a?',
+            '-c', 'copy',
+            '-bsf:a', 'aac_adtstoasc',
+            '-fflags', '+genpts',
+            '-avoid_negative_ts', 'make_zero',
+            '-max_muxing_queue_size', '9999',
+            '-movflags', '+faststart'
+          ];
+        }
+      }
+
+      command
         .outputOptions(outputOptions)
         .output(filePath)
         .on('start', (cmdLine) => {
@@ -6209,6 +6327,37 @@ ipcMain.handle('read-file-text', async (event, filePath) => {
     return { success: true, content, filePath };
   } catch (e) {
     return { success: false, error: e.message };
+  }
+});
+
+ipcMain.removeHandler('resolve-youtube-url');
+ipcMain.handle('resolve-youtube-url', async (event, targetUrl) => {
+  const info = await resolveYouTubeStreams(targetUrl);
+  if (!info) return { success: false, error: 'Gagal mengekstrak YouTube URL.' };
+  return {
+    success: true,
+    title: info.title,
+    videoUrl: info.videoUrl,
+    audioUrl: info.audioUrl,
+    combinedUrl: info.combinedUrl,
+  };
+});
+
+ipcMain.removeHandler('resolve-youtube');
+ipcMain.handle('resolve-youtube', async (event, targetUrl) => {
+  try {
+    const { Ytdl } = require('@distube/ytdl-core');
+    const ytdl = new Ytdl();
+    const info = await ytdl.getInfo(targetUrl);
+    if (!info || !info.formats || info.formats.length === 0) {
+      return '';
+    }
+    const combined = info.formats.filter(f => f.hasVideo && f.hasAudio);
+    const videoOnly = info.formats.filter(f => f.hasVideo && !f.hasAudio);
+    const best = combined.length > 0 ? combined[0] : (videoOnly.length > 0 ? videoOnly[0] : info.formats[0]);
+    return best ? best.url : '';
+  } catch (err) {
+    return '';
   }
 });
 
