@@ -285,7 +285,7 @@ export const isTtsModelStreamSupported = (modelName: string): boolean => {
 };
 
 export function buildTtsParts(text: string, modelName: string, styleInstruction?: string): any[] {
-  const cleanText = text.replace(/[*#_~`]/g, "").slice(0, 800).trim();
+  const cleanText = text.replace(/[*#_~`]/g, "").trim();
   const isModel38 = (modelName || '').toLowerCase().includes('3.8');
   
   if (isModel38 && styleInstruction && styleInstruction.trim()) {
@@ -628,7 +628,7 @@ ATURAN PERILAKU & UNCENSORED MODE (ROLEPLAY AMAN & BEBAS):
       try {
         const ttsPrimaryModel = (ttsModel && ttsModel.includes("gemini")) ? ttsModel : (aiTtsModel || "gemini-3.8-flash-tts");
         const voiceName = voice || "Kore";
-        const cleanReply = replyText.replace(/[*#_~`]/g, "").slice(0, 400).trim();
+        const cleanReply = replyText.replace(/[*#_~`]/g, "").trim();
         const ttsParts = buildTtsParts(cleanReply, ttsPrimaryModel, aiStyleInstruction);
 
         const ttsResult = await executeWithKeyRotation(

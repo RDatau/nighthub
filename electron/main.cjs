@@ -600,7 +600,7 @@ aiApiApp.post('/api/ai/tts', async (req, res) => {
     let audioBase64 = null;
     let mimeType = 'audio/pcm';
 
-    const cleanText = text.replace(/[*#_~`]/g, '').slice(0, 500).trim();
+    const cleanText = text.replace(/[*#_~`]/g, '').trim();
     const voiceName = voice || 'Kore';
     const primaryModel = (ttsModel && ttsModel.includes('gemini')) ? ttsModel : 'gemini-3.1-flash-tts-preview';
 
@@ -784,7 +784,7 @@ aiApiApp.post('/api/ai/live-comment', async (req, res) => {
     let mimeType = 'audio/pcm';
 
     if ((voiceEnabled || mode === 'live_call') && replyText) {
-      const cleanReply = replyText.replace(/[*#_~`]/g, '').slice(0, 400).trim();
+      const cleanReply = replyText.replace(/[*#_~`]/g, '').trim();
       const voiceName = voice || 'Kore';
       const ttsPrimaryModel = ttsModel || aiTtsModel || 'gemini-2.5-pro-preview-tts';
 
